@@ -1,0 +1,4 @@
+node_modules/
+dist/
+p0-spike/results/
+*.log
