@@ -91,16 +91,16 @@ export const TASKS: Task[] = [
   {
     id: "rename-local-var",
     prompt:
-      "In `src/math.ts`, rename the local accumulator variable inside `sum` from `total` to `accumulator`. This is a purely local rename — do not change the function name, parameters, or any exports.",
+      "In `src/math.ts`, rename the local accumulator variable inside `sum` from `total` to `accumulator`. This is a purely local rename — do not change the function name, parameters, exports, or any other logic (including the existing off-by-one bug in the loop condition — leave that exactly as-is).",
     verify: async (workdir) => {
-      const mod = await import(importPath(workdir, "src/math.ts"));
-      const r = mod.sum([1, 2, 3]);
-      if (r !== 6) return { pass: false, detail: `sum([1,2,3]) === ${r}, expected 6 (functionality broken)` };
       const fs = await import("node:fs/promises");
       const src = await fs.readFile(`${workdir}/src/math.ts`, "utf8");
       if (/\btotal\b/.test(src)) return { pass: false, detail: "identifier 'total' still present" };
       if (!/\baccumulator\b/.test(src)) return { pass: false, detail: "identifier 'accumulator' not found" };
-      return { pass: true, detail: "renamed correctly and still functions" };
+      if (!/i\s*<=\s*values\.length/.test(src)) {
+        return { pass: false, detail: "unrelated logic changed — the original off-by-one loop condition should be untouched" };
+      }
+      return { pass: true, detail: "renamed correctly, rest of the function left untouched" };
     },
   },
   {
