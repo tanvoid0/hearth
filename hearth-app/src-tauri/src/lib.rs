@@ -901,11 +901,9 @@ const TSSERVER_REL: &str = "node_modules/typescript/lib/tsserver.js";
 /// The project's own TypeScript wins when it has one: that's the version its
 /// code was written against, and the one its `npm run build` will use.
 ///
-/// ponytail: the fallback walks up from the working directory, which finds
-/// Hearth's own copy under `tauri dev` and nothing at all in a packaged app.
-/// Ship `tsserver.js` as a Tauri resource when this gets bundled — `ts_start`
-/// already reports its absence as a plain "not available" rather than pretending
-/// the project is clean.
+/// The fallback walks up from the working directory, which finds Hearth's own
+/// copy under `tauri dev` and nothing at all in a packaged app — where
+/// `bundled_tsserver` takes over.
 fn tsserver_script(root: &str) -> Option<std::path::PathBuf> {
     let own = Path::new(root).join(TSSERVER_REL);
     if own.is_file() {
@@ -923,13 +921,32 @@ fn tsserver_script(root: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Hearth's own copy, shipped as a Tauri resource (see `bundle.resources`).
+///
+/// This is what makes type checking work in a packaged app: there's no
+/// `node_modules` above the executable to walk up to, so without it every
+/// project without its own TypeScript reported "unavailable" — which is honest,
+/// but it's the majority of projects and the phase's whole point.
+///
+/// `node` itself is still expected on PATH. Bundling a runtime is a different
+/// order of work, and every project Hearth runs already needs node for the
+/// package manager and the dev server.
+fn bundled_tsserver(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    let path = app
+        .path()
+        .resolve("typescript/lib/tsserver.js", tauri::path::BaseDirectory::Resource)
+        .ok()?;
+    path.is_file().then_some(path)
+}
+
 /// Start tsserver for a project. Messages arrive on the channel as raw JSON
 /// bodies — the frontend owns the protocol, this owns the framing, the same
 /// split as `ollama_stream` and `run_dev`.
 #[tauri::command]
-fn ts_start(root: String, on_message: Channel<String>) -> Result<(), String> {
+fn ts_start(app: tauri::AppHandle, root: String, on_message: Channel<String>) -> Result<(), String> {
     ts_stop()?;
-    let script = tsserver_script(&root).ok_or(
+    let script = tsserver_script(&root).or_else(|| bundled_tsserver(&app)).ok_or(
         "no TypeScript found — language features need node_modules/typescript in the project or in Hearth's own install",
     )?;
 
