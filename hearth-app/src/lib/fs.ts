@@ -24,3 +24,16 @@ export function readTextFile(path: string): Promise<string> {
 export function writeTextFile(path: string, contents: string): Promise<void> {
   return invoke("write_text_file", { path, contents });
 }
+
+export interface SearchHit {
+  /** Relative to the project root, forward slashes. */
+  path: string;
+  line: number;
+  text: string;
+}
+
+/** Literal, case-insensitive search across the project. The walk and the skip
+ *  list live in Rust; see `search_files` there for why this isn't ripgrep. */
+export function searchFiles(root: string, query: string, max: number): Promise<SearchHit[]> {
+  return invoke("search_files", { root, query, max });
+}

@@ -7,6 +7,9 @@ import type { FileChange } from "./gitdiff";
 export type Entry =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
+  /** The PLAN step's output. Its own kind so it can be styled as a thing the
+   *  agent is about to do rather than a thing it has done. */
+  | { kind: "plan"; text: string }
   | { kind: "tool"; label: string; ok: boolean; detail: string }
   | { kind: "note"; text: string }
   | { kind: "error"; text: string }

@@ -1,6 +1,7 @@
-import { listDir, readTextFile, writeTextFile } from "./fs";
+import { listDir, readTextFile, searchFiles, writeTextFile } from "./fs";
+import { exportedSymbols, formatRepoMap, isSourceFile } from "./repomap";
 import { applyEdits, resolveInProject, samePath, type Edit } from "./edit";
-import { chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
+import { CANCELLED, chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
 import { contextLimits, packHistory, stalled } from "./session";
 import { useHearthStore } from "./store";
 import { useRunner } from "./runner";
@@ -9,9 +10,9 @@ import { hasChecked, useLsp } from "./lsp";
 import { problemTail } from "./problems";
 import { runCommand } from "./terminal";
 
-// Tool surface is P0's validated set (build plan §5), plus `get_errors` — now
-// all three of plan §10's sources merged: type errors, the dev server's output
-// and the preview's browser console. `search` arrives with P11.
+// Tool surface is P0's validated set (build plan §5), plus `get_errors` — all
+// three of plan §10's sources merged: type errors, the dev server's output and
+// the preview's browser console — plus §11's `search` and `repo_map`.
 export const TOOL_DEFS = [
   {
     type: "function",
@@ -80,6 +81,28 @@ export const TOOL_DEFS = [
   {
     type: "function",
     function: {
+      name: "search",
+      description:
+        "Find which files contain a piece of text — a function name, a string in the UI, an import. Case-insensitive and literal, not a regex. Use this instead of reading files one at a time to find where something lives.",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", description: "The text to look for" } },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "repo_map",
+      description:
+        "List every source file in the project with the names it exports. Use this first on an unfamiliar project to see what exists before reading anything.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "get_errors",
       description:
         "Check the project for errors from three sources: the TypeScript compiler (undefined names, wrong arguments, misspelled props — reported for every file, whether or not the app is running), the dev server's build output, and the running app's browser console. Call this after editing files to check the change compiles AND runs.",
@@ -127,6 +150,9 @@ const MAX_IDENTICAL_CALLS = 3;
  *  hung command would otherwise hold the whole turn open. */
 const COMMAND_TIMEOUT_SECS = 180;
 const MAX_LISTED_ENTRIES = 400;
+/** Enough to see the shape of a match set, few enough that a common word
+ *  doesn't cost the whole context window. */
+const MAX_SEARCH_HITS = 60;
 const SKIP_DIRS = new Set(["node_modules", ".git", "target", "dist", ".hearth"]);
 
 export interface ToolResult {
@@ -215,6 +241,27 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
         await useHearthStore.getState().syncFromDisk(target);
         return { ok: true, output: `created ${args?.path}` };
       }
+      case "search": {
+        const query = String(args?.query ?? "");
+        const hits = await searchFiles(root, query, MAX_SEARCH_HITS);
+        if (hits.length === 0) return { ok: true, output: `no matches for "${query}"` };
+        // The cap has to be visible: a model told "12 matches" when there were
+        // 300 will edit the twelve and call the job done.
+        const capped = hits.length >= MAX_SEARCH_HITS ? `\n… (stopped at ${MAX_SEARCH_HITS} matches — narrow the query)` : "";
+        return { ok: true, output: hits.map((h) => `${h.path}:${h.line}: ${h.text}`).join("\n") + capped };
+      }
+      case "repo_map": {
+        const entries: string[] = [];
+        await walk(root, root, 0, entries);
+        const sources = entries.filter((rel) => !rel.endsWith("/") && isSourceFile(rel));
+        const files = await Promise.all(
+          sources.map(async (rel) => ({
+            path: rel,
+            symbols: exportedSymbols(await readTextFile(resolveInProject(root, rel)).catch(() => "")),
+          })),
+        );
+        return { ok: true, output: formatRepoMap(files, entries.length >= MAX_LISTED_ENTRIES) };
+      }
       case "get_errors": {
         // Type errors first: they cover every file rather than only the one
         // being served, and they exist before the app is ever run.
@@ -280,6 +327,10 @@ function summarize(name: string, args: any): string {
       return `edit_file ${args?.path} (${args?.edits?.length ?? 0} edit${args?.edits?.length === 1 ? "" : "s"})`;
     case "list_files":
       return `list_files ${args?.path ?? "."}`;
+    case "search":
+      return `search "${args?.query ?? ""}"`;
+    case "repo_map":
+      return "repo_map";
     // The user is the only check on what the agent runs, so the row has to show
     // the command itself rather than just the tool's name.
     case "run_command":
@@ -294,9 +345,18 @@ function summarize(name: string, args: any): string {
 export type AgentEvent =
   | { type: "token"; text: string }
   | { type: "assistant"; content: string }
+  | { type: "plan"; text: string }
   | { type: "tool"; label: string; ok: boolean; detail: string }
   | { type: "error"; text: string }
   | { type: "done"; reason: string };
+
+/** What an approval gate is asked about. `detail` is the change itself — the
+ *  new file content, the search/replace pairs, the command — because a gate
+ *  that only shows a tool name is a gate you learn to click through. */
+export interface ApprovalRequest {
+  label: string;
+  detail: string;
+}
 
 export interface RunAgentOptions {
   model: string;
@@ -307,10 +367,58 @@ export interface RunAgentOptions {
   /** Context window for every call in this turn. Bigger holds more files, and
    *  costs VRAM the model itself is competing for. */
   numCtx?: number;
+  /** Names every model call in this turn, so Stop can abort the one in flight
+   *  rather than only stopping the next one. */
+  cancelId?: string;
+  /** Ask the model for a plan before it touches anything (build plan §6). */
+  plan?: boolean;
+  /** Called before every write and every command when set. Resolving false
+   *  refuses that one call and lets the turn carry on. */
+  approve?: (request: ApprovalRequest) => Promise<boolean>;
   onEvent: (event: AgentEvent) => void;
   /** Polled between model calls — the Stop button flips this. */
   shouldStop: () => boolean;
 }
+
+/** Tools that change something outside Hearth. Reading is not gated: an
+ *  approval prompt on every `read_file` is one nobody reads by the third turn,
+ *  and reads are what the model has to do a lot of to be any good. */
+const GATED_TOOLS = new Set(["edit_file", "write_file", "run_command"]);
+
+/** Longest change shown in an approval prompt. A generated file can be
+ *  thousands of lines, and a dialog nobody can scroll to the end of is a
+ *  dialog nobody reads. */
+const MAX_APPROVAL_CHARS = 4000;
+
+/** The change itself, in whatever form the tool takes it. */
+function preview(name: string, args: any): string {
+  const body =
+    name === "edit_file"
+      ? (args?.edits ?? []).map((e: Edit) => `- ${e.search}\n+ ${e.replace}`).join("\n\n")
+      : name === "write_file"
+        ? String(args?.content ?? "")
+        : name === "run_command"
+          ? String(args?.command ?? "")
+          : JSON.stringify(args ?? {}, null, 2);
+  return body.length > MAX_APPROVAL_CHARS ? `${body.slice(0, MAX_APPROVAL_CHARS)}\n… (truncated)` : body;
+}
+
+/**
+ * The PLAN step of build plan §6, which calls it "the biggest quality lever for
+ * local models".
+ *
+ * One tool-free call before the loop starts. Tool-free is the point: a model
+ * handed tools uses them, and what's wanted here is the thinking that would
+ * otherwise happen one tool call at a time — and be re-derived from scratch
+ * every time the context window trims. Costs one extra call per turn, which is
+ * why it's a switch rather than a law.
+ */
+const PLAN_PROMPT =
+  "Before touching anything, write a short numbered plan for this task: which files you expect to " +
+  "read or change, what the change is, and what you will check afterwards. At most five steps. " +
+  "Do not call any tools yet and do not write out the code — just the plan.";
+
+const PLAN_ACK = "Now carry that out with the tools, adjusting the plan if what you read contradicts it.";
 
 export function systemPrompt(root: string, activeFile?: string | null): string {
   return [
@@ -319,6 +427,8 @@ export function systemPrompt(root: string, activeFile?: string | null): string {
     'the "finish" tool with a short summary. Work in as few steps as needed. Always read a file',
     "with read_file before editing it — never guess its contents. Use edit_file for existing files",
     "and write_file only for brand-new files. All paths are relative to the project root.",
+    "To find where something lives, use search (which files contain this text) or repo_map (what",
+    "this project exports, by file) rather than reading files one at a time.",
     "After you change a file, call get_errors. It reports type errors from the TypeScript compiler,",
     "the dev server's build output, and the running page's browser console — code that compiles can",
     "still crash on load, and a type error is reported whether or not the app is running. Fix",
@@ -339,7 +449,7 @@ export function systemPrompt(root: string, activeFile?: string | null): string {
  * Returns the extended history so the next turn keeps the context.
  */
 export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
-  const { model, root, prompt, onEvent, shouldStop, numCtx = DEFAULT_NUM_CTX } = opts;
+  const { model, root, prompt, onEvent, shouldStop, numCtx = DEFAULT_NUM_CTX, cancelId = "" } = opts;
   const { history: budget, read: maxRead } = contextLimits(numCtx);
   const messages: ChatMessage[] =
     opts.history.length > 0
@@ -355,6 +465,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
   const signatures: string[] = [];
 
   try {
+    if (opts.plan) {
+      messages.push({ role: "user", content: PLAN_PROMPT });
+      const planned = await chat(
+        model,
+        packHistory(messages, budget),
+        [], // no tools: the point is the thinking, not an early edit
+        (text) => {
+          if (!shouldStop()) onEvent({ type: "token", text });
+        },
+        numCtx,
+        cancelId
+      );
+      messages.push(planned);
+      messages.push({ role: "user", content: PLAN_ACK });
+      onEvent({ type: "plan", text: planned.content.trim() });
+    }
+
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       if (shouldStop()) {
         onEvent({ type: "done", reason: "stopped" });
@@ -375,7 +502,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
         (text) => {
           if (!shouldStop()) onEvent({ type: "token", text });
         },
-        numCtx
+        numCtx,
+        cancelId
       );
       messages.push(reply);
       if (reply.content.trim()) onEvent({ type: "assistant", content: reply.content });
@@ -443,6 +571,26 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
           continue;
         }
 
+        // Build plan §6's approval gate. Refusing one call doesn't end the
+        // turn: the model is told no and gets to decide what to do instead,
+        // which is what makes this different from Stop.
+        if (opts.approve && GATED_TOOLS.has(name)) {
+          const label = summarize(name, args);
+          if (!(await opts.approve({ label, detail: preview(name, args) }))) {
+            const refusal = "the user refused this — do not retry it; either work another way or explain why you can't";
+            messages.push({ role: "tool", tool_name: name, content: refusal });
+            onEvent({ type: "tool", label: `refused · ${label}`, ok: false, detail: refusal });
+            // Recorded like any other call, so a model that asks three times
+            // trips the loop detector instead of asking forever.
+            signatures.push(`${name}:${JSON.stringify(args ?? null)}:refused`);
+            if (stalled(signatures, MAX_IDENTICAL_CALLS)) {
+              onEvent({ type: "done", reason: `stopped: ${label} was refused ${MAX_IDENTICAL_CALLS} times` });
+              return messages;
+            }
+            continue;
+          }
+        }
+
         const result = await dispatchTool(root, name, args, maxRead);
         // Draw the line the next get_errors reports against: console messages
         // logged before this write describe the code the agent just replaced.
@@ -478,6 +626,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
     }
     onEvent({ type: "done", reason: `hit the ${MAX_ITERATIONS}-step cap` });
   } catch (err) {
+    // Stop aborts the call in flight, which surfaces here as a rejection. It's
+    // the user's own decision, not a failure — reporting it in red would train
+    // people not to press it.
+    if ((err as Error).message === CANCELLED) {
+      onEvent({ type: "done", reason: "stopped" });
+      return messages;
+    }
     onEvent({ type: "error", text: (err as Error).message });
     onEvent({ type: "done", reason: "error" });
   }

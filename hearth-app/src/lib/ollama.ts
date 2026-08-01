@@ -104,7 +104,10 @@ export async function chat(
   messages: ChatMessage[],
   tools: readonly unknown[],
   onToken: (text: string) => void,
-  numCtx = DEFAULT_NUM_CTX
+  numCtx = DEFAULT_NUM_CTX,
+  /** Names this call so `cancelChat` can abort it. Empty means uncancellable,
+   *  which is only right for a caller that has no Stop button. */
+  cancelId = ""
 ): Promise<ChatMessage> {
   let content = "";
   const toolCalls: ToolCall[] = [];
@@ -131,10 +134,29 @@ export async function chat(
   };
 
   await invoke("ollama_chat", {
+    id: cancelId,
     body: { model, messages, tools, stream: true, options: { num_ctx: numCtx } },
     onChunk,
   });
 
   if (streamError) throw new Error(streamError);
   return { role: "assistant", content, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) };
+}
+
+/** What a cancelled call rejects with — matched, not displayed, so a deliberate
+ *  Stop doesn't surface as a model failure. Must match `CANCELLED` in lib.rs. */
+export const CANCELLED = "cancelled";
+
+/**
+ * Abort an in-flight call by the id it was started with.
+ *
+ * The Stop button used to only take effect between steps, which is no help at
+ * all in the case it exists for: a model that spilled to CPU spends minutes
+ * inside one call. This drops the request itself, so Ollama stops generating
+ * rather than generating into a void.
+ */
+export async function cancelChat(cancelId: string): Promise<void> {
+  await invoke("ollama_cancel", { id: cancelId }).catch(() => {
+    // Nothing in flight under that id — already finished, or never started.
+  });
 }

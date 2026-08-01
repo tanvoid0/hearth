@@ -22,6 +22,7 @@ import { TOOL_DEFS, systemPrompt } from "../../hearth-app/src/lib/agent.ts";
 import { applyEdits } from "../../hearth-app/src/lib/edit.ts";
 import { consoleTail, devLogTail } from "../../hearth-app/src/lib/runlog.ts";
 import { problemTail } from "../../hearth-app/src/lib/problems.ts";
+import { exportedSymbols, formatRepoMap, isSourceFile } from "../../hearth-app/src/lib/repomap.ts";
 
 const MAX_ITERATIONS = 15;
 // Same cap the app applies to auto-repair rounds (build plan §6).
@@ -96,7 +97,7 @@ export async function probe(model: string): Promise<ProbeResult> {
   const errorReport = () =>
     [
       problemTail("ok", [], root),
-      devLogTail(true, "http://localhost:5173/", repaired ? CLEAN_LOG : BROKEN_LOG),
+      devLogTail("ready", "http://localhost:5173/", repaired ? CLEAN_LOG : BROKEN_LOG),
       consoleTail(false, []),
     ].join("\n\n");
 
@@ -121,6 +122,26 @@ export async function probe(model: string): Promise<ProbeResult> {
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.writeFile(target, args?.content ?? "", "utf8");
         return `created ${rel}`;
+      // The two P11 tools. Answerable rather than faithful: a model that calls
+      // one and gets "unknown tool" back would skew the measurement this probe
+      // exists for, and the canned world is three files deep.
+      case "search": {
+        const needle = String(args?.query ?? "").toLowerCase();
+        const hits = Object.entries(FILES).flatMap(([file, body]) =>
+          body
+            .split("\n")
+            .map((line, i) => ({ file, i, line }))
+            .filter(({ line }) => line.toLowerCase().includes(needle))
+            .map(({ file, i, line }) => `${file}:${i + 1}: ${line.trim()}`),
+        );
+        return hits.length > 0 ? hits.join("\n") : `no matches for "${args?.query ?? ""}"`;
+      }
+      case "repo_map":
+        return formatRepoMap(
+          Object.entries(FILES)
+            .filter(([file]) => isSourceFile(file))
+            .map(([file, body]) => ({ path: file, symbols: exportedSymbols(body) })),
+        );
       case "get_errors":
         // All three of the app's sources, through the app's own formatters —
         // the model has to see the shape it will really be handed, or the

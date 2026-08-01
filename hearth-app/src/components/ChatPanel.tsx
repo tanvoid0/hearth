@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { useHearthStore } from "../lib/store";
-import { runAgent } from "../lib/agent";
+import { runAgent, type ApprovalRequest } from "../lib/agent";
 import { chatFor, useChatStore, type Entry } from "../lib/chat";
 import { pullPercent, type PullState } from "../lib/pull";
 import { changedFiles, commitAll, ensureRepo, fileVersions, restore } from "../lib/git";
 import { changeLabel, type FileChange } from "../lib/gitdiff";
 import { RichText } from "./RichText";
 import {
+  cancelChat,
   DEFAULT_NUM_CTX,
   listModels,
   loadedModel,
@@ -19,6 +20,8 @@ import {
 
 const MODEL_KEY = "hearth.model";
 const CTX_KEY = "hearth.numCtx";
+const PLAN_KEY = "hearth.plan";
+const ASK_KEY = "hearth.ask";
 /** Only while a turn is in flight — that's when the split is worth knowing and
  *  the only time it changes on its own. */
 const LOAD_POLL_MS = 5000;
@@ -201,6 +204,14 @@ export function ChatPanel() {
   const [totalVram, setTotalVram] = useState<number | null>(null);
   const [pullName, setPullName] = useState<string | null>(null);
   const [pull, setPull] = useState<PullState | null>(null);
+  // Default on: plan §6 calls PLAN the biggest quality lever for local models,
+  // and it costs one call.
+  const [planFirst, setPlanFirst] = useState(() => localStorage.getItem(PLAN_KEY) !== "0");
+  // Default off: checkpoints already make every turn reversible, so the gate is
+  // for people who want to watch rather than the only thing standing between a
+  // bad edit and a lost afternoon.
+  const [askFirst, setAskFirst] = useState(() => localStorage.getItem(ASK_KEY) === "1");
+  const [pending, setPending] = useState<(ApprovalRequest & { resolve: (ok: boolean) => void }) | null>(null);
 
   const { entries } = useChatStore(chatFor(projectRoot));
   const addEntry = useChatStore((s) => s.addEntry);
@@ -208,6 +219,26 @@ export function ChatPanel() {
 
   const stopRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  /** Names the model call in flight, so Stop can abort it rather than wait it
+   *  out. A model on the CPU spends minutes inside one call. */
+  const cancelRef = useRef("");
+
+  /** Hold the turn until the user answers. Resolving false refuses that one
+   *  call; the turn carries on and the model is told no. */
+  function requestApproval(request: ApprovalRequest): Promise<boolean> {
+    return new Promise((resolve) => setPending({ ...request, resolve }));
+  }
+
+  function answer(ok: boolean) {
+    pending?.resolve(ok);
+    setPending(null);
+  }
+
+  function stop() {
+    stopRef.current = true;
+    answer(false); // a gate left open would hold the turn forever
+    void cancelChat(cancelRef.current);
+  }
 
   async function loadModels() {
     setModelsError(null);
@@ -232,6 +263,11 @@ export function ChatPanel() {
   useEffect(() => {
     localStorage.setItem(CTX_KEY, String(numCtx));
   }, [numCtx]);
+
+  useEffect(() => {
+    localStorage.setItem(PLAN_KEY, planFirst ? "1" : "0");
+    localStorage.setItem(ASK_KEY, askFirst ? "1" : "0");
+  }, [planFirst, askFirst]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
@@ -313,6 +349,7 @@ export function ChatPanel() {
     setRunning(true);
     setElapsed(0);
     stopRef.current = false;
+    cancelRef.current = `${root}#${Date.now()}`;
 
     // Baseline the project before the turn, so the checkpoint below is this
     // turn's diff rather than the whole project. First call on a large repo
@@ -331,6 +368,9 @@ export function ChatPanel() {
       history: useChatStore.getState().chats[root]?.history ?? [],
       activeFile: activePath,
       numCtx,
+      cancelId: cancelRef.current,
+      plan: planFirst,
+      approve: askFirst ? requestApproval : undefined,
       shouldStop: () => stopRef.current,
       onEvent: (event) => {
         switch (event.type) {
@@ -340,6 +380,10 @@ export function ChatPanel() {
           case "assistant":
             setStreaming("");
             add({ kind: "assistant", text: event.content });
+            break;
+          case "plan":
+            setStreaming("");
+            add({ kind: "plan", text: event.text });
             break;
           case "tool":
             add({ kind: "tool", label: event.label, ok: event.ok, detail: event.detail });
@@ -494,6 +538,13 @@ export function ChatPanel() {
                 {entry.text}
               </div>
             );
+          if (entry.kind === "plan")
+            return (
+              <div key={i} className="rounded border-l-2 border-neutral-700 bg-neutral-950/60 px-2 py-1.5">
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-neutral-600">plan</div>
+                <RichText text={entry.text} />
+              </div>
+            );
           return <RichText key={i} text={entry.text} />;
         })}
 
@@ -505,6 +556,32 @@ export function ChatPanel() {
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* The gate. Above the composer rather than in the transcript because the
+          turn is blocked on it — a prompt that scrolls away is one the user
+          waits on without knowing why. */}
+      {pending && (
+        <div className="shrink-0 border-t border-amber-900/60 bg-amber-950/20 p-2">
+          <div className="mb-1 flex items-center gap-2">
+            <span className="truncate font-mono text-[12px] text-amber-200">{pending.label}</span>
+            <button
+              onClick={() => answer(true)}
+              className="ml-auto shrink-0 rounded bg-emerald-900/70 px-2 py-0.5 text-[12px] text-emerald-100 hover:bg-emerald-900"
+            >
+              Allow
+            </button>
+            <button
+              onClick={() => answer(false)}
+              className="shrink-0 rounded bg-neutral-800 px-2 py-0.5 text-[12px] text-neutral-300 hover:bg-neutral-700"
+            >
+              Refuse
+            </button>
+          </div>
+          <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-950 p-2 text-[11px] text-neutral-400">
+            {pending.detail}
+          </pre>
+        </div>
+      )}
 
       <div className="shrink-0 border-t border-neutral-800 p-2">
         <textarea
@@ -521,13 +598,30 @@ export function ChatPanel() {
           placeholder="Ask the model to change this project…"
           className="w-full resize-none rounded bg-neutral-800 p-2 text-[13px] text-neutral-100 outline-none placeholder:text-neutral-600 disabled:opacity-50"
         />
-        <div className="mt-1 flex items-center justify-between">
-          <span className="text-[11px] text-neutral-600">Enter to send · Shift+Enter for a newline</span>
+        <div className="mt-1 flex items-center gap-1.5">
+          <button
+            onClick={() => setPlanFirst((v) => !v)}
+            title="Ask the model for a numbered plan before it touches anything. One extra call per turn, and the biggest quality lever there is for a local model."
+            className={`rounded px-1.5 py-0.5 text-[11px] ${
+              planFirst ? "bg-neutral-700 text-neutral-100" : "bg-neutral-800 text-neutral-500 hover:text-neutral-300"
+            }`}
+          >
+            Plan
+          </button>
+          <button
+            onClick={() => setAskFirst((v) => !v)}
+            title="Show every file write and every command before it happens, and wait for you. Off by default: every turn is a checkpoint you can roll back."
+            className={`rounded px-1.5 py-0.5 text-[11px] ${
+              askFirst ? "bg-neutral-700 text-neutral-100" : "bg-neutral-800 text-neutral-500 hover:text-neutral-300"
+            }`}
+          >
+            Ask first
+          </button>
+          <span className="ml-auto truncate text-[11px] text-neutral-600">Enter to send</span>
           {running ? (
             <button
-              onClick={() => {
-                stopRef.current = true;
-              }}
+              onClick={stop}
+              title="Aborts the model call in flight, not just the next step."
               className="rounded bg-red-900/70 px-2 py-1 text-[12px] text-red-200 hover:bg-red-900"
             >
               Stop
