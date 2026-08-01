@@ -1201,6 +1201,69 @@ the main one leaves it in view. The palette has it too.
   store change, and two panes handling them would race with the second winning.
   Closing a tab closes a split pinned to it.
 
+### A turn survives the reload that killed it
+
+Conversations moved to SQLite, and the thing that still didn't survive a reload
+was the turn that was *running* during it. On a local model that's minutes of
+work: the plan, the searches, every file read, every edit. Reload while gemma4
+is thinking and all of it went, leaving a transcript whose last row was a tool
+call with no outcome and no way to tell whether the edit landed.
+
+The turn is now written down as it goes, and the panel offers it back.
+
+- **`pending` sits beside `history`, not in it.** `history` is the record of
+  *completed* turns — what the next turn is sent as context. An abandoned turn
+  must not leak into that (the model would be handed half a conversation as
+  though it had happened), and a resumed one has to pick up the tool results it
+  already paid for rather than start the same work again. Two fields, because
+  those are two different questions.
+- **Checkpointed at the top of the loop, not after every push.** That's the one
+  place the message list is a history a model can actually be handed: it ends on
+  the user's prompt or on a *complete* set of tool results, never on a tool call
+  whose result is still missing. Persisting mid-batch would save a conversation
+  that can't be resumed at all. The cost is the split second between the
+  checkpoint and the reply — one question re-asked.
+- **The orphan is killed on sight.** A reload doesn't stop the model: the request
+  lives in the Rust process, which streams on into a channel the dead page took
+  with it. So Ollama holds the GPU generating a reply nobody can read, and a
+  resume competes with it for the card. The cancel-id registry outlives the page
+  for exactly this reason, and cancelling an id that's already gone (app restart,
+  turn finished) is a no-op — so spotting a `pending` is enough to justify the
+  call.
+- **Offered, never auto-resumed.** The reload is often the user escaping a turn
+  that was going nowhere, and a turn that took the app down with it would
+  relaunch itself on every start. The button reads **Resume** when there's a
+  partial to carry on from and **Retry** when the turn died before completing a
+  single step — different actions, and a user about to pay minutes for one
+  deserves to know which.
+- **`wrote` is recovered from the messages.** It's the flag deciding whether an
+  unfinished turn gets verified or just ends, and the writes it describes
+  happened in a process that no longer exists. Counted from the last user message
+  on, so an earlier turn's edits don't put a project-wide type check in front of
+  a conversational reply. It lives in [`session.ts`](hearth-app/src/lib/session.ts)
+  as `wroteThisTurn`, import-free and unit-tested, including the PLAN case where
+  the last user message is the plan's acknowledgement rather than the prompt.
+- A resume is itself resumable: the messages it starts from are written back as
+  the new turn's `partial` before its first call.
+
+**Two bugs found on the way there, both in the "it failed quietly" family.**
+`db()` cached its connection with `??=`, which also caches a *rejected* promise —
+one bad open at startup meant every later read and write failing, forever, on a
+store whose writes swallow their errors by design. And `openFolder` /
+`rehydrateFromDisk` awaited the chat hydrate and the language-server start in
+sequence with nothing between them, so a tsserver that wouldn't spawn took the
+transcript down with it and the throw went somewhere nobody would see. Chat first
+now, and neither allowed to take the other down.
+
+**The thinking indicator is a flame.** It was the word "thinking…" with a live
+second count, which is the one thing on screen separating a working turn from a
+hung one — and a static word is the same picture at 3 seconds and at 300. Three
+sprite frames stacked in one SVG, cycled in CSS: a sprite flicker rather than a
+transform, because the tip moves between frames and the base doesn't, which is
+what makes it read as a fire rather than a wobbling icon. No image file, nothing
+to decode, nothing to load. `prefers-reduced-motion` gets one lit frame, and the
+seconds keep counting either way.
+
 ---
 
 ## Remaining work
@@ -1240,18 +1303,19 @@ decisions rather than backlog.
       it, and a button to do the same thing 20 seconds earlier isn't worth its
       own control.
 - [x] **P6 · Chat** — streaming chat, code-block and inline-code rendering, and
-      transcripts that survive a restart, kept per project.
+      transcripts that survive a restart, kept per project. The turn that was
+      *running* during the restart survives too, offered back as Resume or
+      Retry rather than replayed on its own (above).
 - [x] **P6 · conversation persistence via `tauri-plugin-sql`** — one row per
       entry, nothing trimmed, and one database across every project so the
       conversations are searchable from the Search panel (above). That last part
       is what made SQLite the right answer rather than a heavier file.
-- [~] ~~**P6 · conversation persistence via `tauri-plugin-sql`**~~ — the one item
-      still genuinely open, and it stays open on purpose. Transcripts already
-      survive restarts in `localStorage`, keyed per project and trimmed to a
-      200k-char budget. SQLite buys unbounded history and queryability across
-      projects; neither is a felt problem yet. Do it when the trim starts
-      cutting something someone wanted — which is a thing that can be noticed
-      rather than predicted.
+- [~] ~~**P6 · conversation persistence via `tauri-plugin-sql`**~~ — kept for
+      what it got wrong. This was parked as "not a felt problem yet: transcripts
+      already survive in `localStorage`, trimmed to a 200k-char budget. Do it
+      when the trim starts cutting something someone wanted." The trim was never
+      the reason. Cross-project search was, and that isn't a thing waiting to be
+      noticed — a feature nobody can have yet produces no complaints.
 
 ### Milestone C — the agent
 
@@ -1464,11 +1528,12 @@ cd hearth-app && npm run tauri dev
 ```
 
 ```bash
-# Unit tests (113): path safety, search/replace, session packing, context
-# sizing, run-state machine, dev-log and missing-package parsing, pull progress,
-# fenced-code splitting, checkpoint name-status, hunk parsing, repo-map
-# extraction, .env redaction, diagnostic folding, transcript framing — plus the
-# chat store's SQL against a real SQLite, and one that drives a real tsserver
+# Unit tests (114): path safety, search/replace, session packing, context
+# sizing, interrupted-turn recovery, run-state machine, dev-log and
+# missing-package parsing, pull progress, fenced-code splitting, checkpoint
+# name-status, hunk parsing, repo-map extraction, .env redaction, diagnostic
+# folding, transcript framing — plus the chat store's SQL against a real
+# SQLite, and one that drives a real tsserver
 cd hearth-app && npm test
 ```
 

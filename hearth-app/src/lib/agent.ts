@@ -3,7 +3,7 @@ import { exportedSymbols, formatRepoMap, isSourceFile } from "./repomap";
 import { isSecretFile, redactEnv } from "./secrets";
 import { applyEdits, changedLines, resolveInProject, samePath, type Edit } from "./edit";
 import { CANCELLED, chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
-import { contextLimits, packHistory, stalled } from "./session";
+import { contextLimits, packHistory, stalled, wroteThisTurn } from "./session";
 import { useHearthStore } from "./store";
 import { useRunner } from "./runner";
 import { consoleTail, countErrorsSince, devLogTail } from "./runlog";
@@ -384,6 +384,16 @@ export interface RunAgentOptions {
   cancelId?: string;
   /** Ask the model for a plan before it touches anything (build plan §6). */
   plan?: boolean;
+  /** Messages from a turn that was cut off mid-flight. When set, the turn picks
+   *  up from them instead of opening a new one: `prompt` is already the last
+   *  user message in there, along with every tool result collected before the
+   *  interruption. The PLAN step doesn't re-run — either it's in here already,
+   *  or the turn died before it produced one. */
+  resume?: ChatMessage[];
+  /** Called at each point the message list is a place the turn could restart
+   *  from: before every model call, never part-way through a tool-call batch.
+   *  Persisted by the caller, so a reload doesn't cost the work already done. */
+  onStep?: (messages: ChatMessage[]) => void;
   /** Called before every write and every command when set. Resolving false
    *  refuses that one call and lets the turn carry on. */
   approve?: (request: ApprovalRequest) => Promise<boolean>;
@@ -463,21 +473,25 @@ export function systemPrompt(root: string, activeFile?: string | null): string {
 export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
   const { model, root, prompt, onEvent, shouldStop, numCtx = DEFAULT_NUM_CTX, cancelId = "" } = opts;
   const { history: budget, read: maxRead } = contextLimits(numCtx);
-  const messages: ChatMessage[] =
-    opts.history.length > 0
+  const resuming = (opts.resume?.length ?? 0) > 0;
+  const messages: ChatMessage[] = resuming
+    ? [...opts.resume!]
+    : opts.history.length > 0
       ? [...opts.history]
       : [{ role: "system", content: systemPrompt(root, opts.activeFile) }];
-  messages.push({ role: "user", content: prompt });
+  if (!resuming) messages.push({ role: "user", content: prompt });
 
   let repairs = 0;
   /** Whether this turn changed anything on disk — what makes an unfinished
-   *  turn worth verifying rather than just ending. */
-  let wrote = false;
+   *  turn worth verifying rather than just ending. Recovered from the messages
+   *  when resuming: those writes happened, even though this process didn't make
+   *  them. */
+  let wrote = resuming && wroteThisTurn(messages);
   /** One entry per tool call: the call and what it returned. See `stalled`. */
   const signatures: string[] = [];
 
   try {
-    if (opts.plan) {
+    if (opts.plan && !resuming) {
       messages.push({ role: "user", content: PLAN_PROMPT });
       const planned = await chat(
         model,
@@ -499,6 +513,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
         onEvent({ type: "done", reason: "stopped" });
         return messages;
       }
+
+      // The last safe place to restart from. Here rather than after each push:
+      // the list ends on the user's prompt or on a complete set of tool
+      // results, never on a tool call whose result is still missing — which is
+      // a history no model can be handed. The cost of the split second between
+      // here and the reply is re-asking one question; the cost of persisting
+      // mid-batch is a conversation that can't be resumed at all.
+      opts.onStep?.(messages);
 
       // Send a windowful, keep the whole thing. A conversation outgrows the
       // context long before it outgrows storage, and Ollama's own overflow

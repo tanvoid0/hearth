@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { contextLimits, packHistory, packTab, rebaseTab, stalled, trimForStorage, type Tab } from "./session.ts";
+import {
+  contextLimits,
+  packHistory,
+  packTab,
+  rebaseTab,
+  stalled,
+  trimForStorage,
+  wroteThisTurn,
+  type Tab,
+} from "./session.ts";
 
 const tab = (content: string, savedContent: string): Tab => ({
   path: "C:/p/a.ts",
@@ -71,6 +80,49 @@ test("a turn interrupted mid-flight comes back resumable, and out of history", (
   assert.ok(
     packed.every((m, i) => i === 0 || m.role !== "tool" || packed[i - 1]?.role === "assistant"),
     "a trimmed resume must not open on a tool result whose call went with it",
+  );
+});
+
+test("a resumed turn remembers the writes it made before the reload", () => {
+  const earlierTurn = [
+    { role: "system", content: "you are working in C:/proj" },
+    { role: "user", content: "add a header" },
+    { role: "assistant", content: "" },
+    { role: "tool", tool_name: "write_file", content: "wrote src/Header.jsx" },
+    { role: "assistant", content: "done" },
+  ];
+  // A new question after all that: this turn has written nothing yet, and
+  // counting the last one's write would put a project check in front of a
+  // reply that changed no files.
+  assert.equal(wroteThisTurn([...earlierTurn, { role: "user", content: "what does it do?" }]), false);
+
+  // The case that matters: cut off after an edit landed. Ending here without
+  // verifying reports a half-finished turn as a successful one.
+  assert.equal(
+    wroteThisTurn([
+      ...earlierTurn,
+      { role: "user", content: "rename it" },
+      { role: "assistant", content: "" },
+      { role: "tool", tool_name: "read_file", content: "…" },
+      { role: "assistant", content: "" },
+      { role: "tool", tool_name: "edit_file", content: "applied" },
+    ]),
+    true,
+  );
+
+  // With PLAN on, the last user message is the plan's acknowledgement rather
+  // than the prompt — still inside the turn, still ahead of every tool call.
+  assert.equal(
+    wroteThisTurn([
+      { role: "system", content: "you are working in C:/proj" },
+      { role: "user", content: "rename it" },
+      { role: "user", content: "write a short numbered plan" },
+      { role: "assistant", content: "1. read it 2. rename it" },
+      { role: "user", content: "now carry that out" },
+      { role: "assistant", content: "" },
+      { role: "tool", tool_name: "edit_file", content: "applied" },
+    ]),
+    true,
   );
 });
 

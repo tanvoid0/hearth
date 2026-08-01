@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useHearthStore } from "../lib/store";
 import { runAgent, type ApprovalRequest } from "../lib/agent";
 import { chatFor, useChatStore, type Entry } from "../lib/chat";
+import type { ChatMessage } from "../lib/ollama";
 import { pullPercent, type PullState } from "../lib/pull";
 import { changedFiles, commitAll, ensureRepo, fileVersions, restore } from "../lib/git";
 import { changeLabel, type FileChange } from "../lib/gitdiff";
@@ -83,6 +84,42 @@ function LoadBadge({
     >
       {load.gpuPercent}% GPU{stale ? ` at ${load.contextLength / 1024}k` : ""}
     </button>
+  );
+}
+
+/** Three frames of a pixel flame — the hearth, working. `o` is the body, `i`
+ *  the hot core, `.` nothing. Only the tip differs between frames; a base that
+ *  moves too reads as a bouncing icon rather than a fire. */
+const FLAME_FRAMES = [
+  ["...o...", "..ooo..", "..ooo..", ".ooioo.", ".oiiio.", "ooiiioo", "ooiiioo", ".ooooo.", "..ooo.."],
+  ["..o....", "..oo...", ".ooo...", ".ooio..", "ooiiio.", "ooiiioo", "ooiiioo", ".ooooo.", "..ooo.."],
+  ["....o..", "...oo..", "...ooo.", "..oioo.", ".oiiioo", "ooiiioo", "ooiiioo", ".ooooo.", "..ooo.."],
+];
+
+/**
+ * The activity indicator, as a picture rather than a moving word.
+ *
+ * A turn on a local model runs for minutes, and this is the one thing on screen
+ * that separates "working" from "hung" — so it has to read as movement from
+ * across the desk, which text dressed up with an animation doesn't. Frames are
+ * stacked in one SVG and cycled in CSS (`.hearth-flame`), which is a sprite
+ * animation with no image file, no decoder and nothing to load.
+ */
+function ThinkingFlame() {
+  return (
+    <svg viewBox="0 0 7 9" className="hearth-flame h-3 w-[9px] shrink-0" aria-hidden="true">
+      {FLAME_FRAMES.map((rows, frame) => (
+        <g key={frame}>
+          {rows.flatMap((row, y) =>
+            [...row].map((px, x) =>
+              px === "." ? null : (
+                <rect key={`${x}-${y}`} x={x} y={y} width="1" height="1" fill={px === "i" ? "#fcd34d" : "#f97316"} />
+              ),
+            ),
+          )}
+        </g>
+      ))}
+    </svg>
   );
 }
 
@@ -216,8 +253,12 @@ export function ChatPanel() {
   const [askFirst, setAskFirst] = useState(() => localStorage.getItem(ASK_KEY) === "1");
   const [pending, setPending] = useState<(ApprovalRequest & { resolve: (ok: boolean) => void }) | null>(null);
 
-  const { entries } = useChatStore(chatFor(projectRoot));
+  // `interrupted` is a turn this panel never got to finish — the page was
+  // reloaded or the app was killed while the model was working. It outlives the
+  // process it started in; `running` doesn't.
+  const { entries, pending: interrupted } = useChatStore(chatFor(projectRoot));
   const addEntry = useChatStore((s) => s.addEntry);
+  const dropPending = useChatStore((s) => s.dropPending);
   const clearChat = useChatStore((s) => s.clearChat);
 
   const stopRef = useRef(false);
@@ -334,6 +375,16 @@ export function ChatPanel() {
     setStreaming("");
   }, [projectRoot]);
 
+  // A reload doesn't stop the model — the request lives in the Rust process,
+  // which streams on into a channel the dead page took with it. Kill the orphan
+  // as soon as one is spotted: it's holding the GPU that a resume needs, and
+  // Ollama would otherwise generate the rest of a reply nobody can read. Safe
+  // when the id is already gone (app restart, turn finished): cancel of an
+  // unknown id is a no-op.
+  useEffect(() => {
+    if (interrupted && !running) void cancelChat(interrupted.cancelId);
+  }, [interrupted?.cancelId, running]);
+
   // A project created from a prompt runs that prompt as its first turn. Waits
   // on `model` because the picker is populated by an async /api/tags call.
   useEffect(() => {
@@ -342,17 +393,25 @@ export function ChatPanel() {
     if (prompt) void send(prompt);
   }, [pendingPrompt, model, running]);
 
-  async function send(prompt: string) {
+  /** `resume` is an interrupted turn's messages: the same turn carrying on,
+   *  rather than the same prompt asked again from nothing. */
+  async function send(prompt: string, resume?: ChatMessage[]) {
     if (!prompt || running || !projectRoot || !model) return;
     const root = projectRoot;
     const add = (entry: Entry) => addEntry(root, entry);
 
-    add({ kind: "user", text: prompt });
+    // The prompt is already in the transcript when resuming — this is the turn
+    // the user is looking at, not a new one.
+    if (!resume) add({ kind: "user", text: prompt });
     setStreaming("");
     setRunning(true);
     setElapsed(0);
     stopRef.current = false;
     cancelRef.current = `${root}#${Date.now()}`;
+    // Marks the turn in flight *before* the first await. Everything from here
+    // to `endTurn` can be cut short by a reload, and what survives it is what
+    // was written to the store.
+    useChatStore.getState().beginTurn(root, prompt, cancelRef.current, resume);
 
     // Baseline the project before the turn, so the checkpoint below is this
     // turn's diff rather than the whole project. First call on a large repo
@@ -373,6 +432,11 @@ export function ChatPanel() {
       numCtx,
       cancelId: cancelRef.current,
       plan: planFirst,
+      resume,
+      // Every step the turn could be picked up from, written where a reload
+      // can find it. A turn cut off after ten minutes of tool calls resumes
+      // holding all of them, rather than paying for them twice.
+      onStep: (messages) => useChatStore.getState().stepTurn(root, messages),
       approve: askFirst ? requestApproval : undefined,
       shouldStop: () => stopRef.current,
       onEvent: (event) => {
@@ -404,7 +468,9 @@ export function ChatPanel() {
       },
     });
 
-    useChatStore.getState().setHistory(root, history);
+    // Commits the turn and clears the in-flight marker together: a history that
+    // landed without the marker being dropped would offer to run it all again.
+    useChatStore.getState().endTurn(root, history);
 
     // Checkpoint the turn (plan §7). Wrapped, because git can be missing
     // entirely and a failed commit must not cost the user the turn that
@@ -553,12 +619,48 @@ export function ChatPanel() {
 
         {streaming && <RichText text={streaming} />}
         {running && (
-          <div className="px-2 text-[11px] text-neutral-500">
-            {streaming ? "writing" : "thinking"}… {elapsed}s
+          <div className="flex items-center gap-1.5 px-2 text-[11px] text-neutral-500">
+            <ThinkingFlame />
+            <span>
+              {streaming ? "writing" : "thinking"}… {elapsed}s
+            </span>
           </div>
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* A turn that died with the page. Offered rather than restarted on its
+          own: the reload is often the user escaping a turn that was going
+          nowhere, and a turn that took the app down with it would relaunch
+          itself on every start. */}
+      {interrupted && !running && (
+        <div className="shrink-0 border-t border-amber-900/60 bg-amber-950/20 p-2">
+          <div className="flex items-center gap-2">
+            <span className="min-w-0 flex-1 truncate text-[12px] text-amber-200" title={interrupted.prompt}>
+              Interrupted: {interrupted.prompt}
+            </span>
+            <button
+              onClick={() => void send(interrupted.prompt, interrupted.partial)}
+              disabled={!model}
+              className="shrink-0 rounded bg-emerald-900/70 px-2 py-0.5 text-[12px] text-emerald-100 hover:bg-emerald-900 disabled:opacity-40"
+            >
+              {interrupted.partial ? "Resume" : "Retry"}
+            </button>
+            <button
+              onClick={() => projectRoot && dropPending(projectRoot)}
+              title="Leave the turn unfinished. The files it already changed stay as they are."
+              className="shrink-0 rounded bg-neutral-800 px-2 py-0.5 text-[12px] text-neutral-300 hover:bg-neutral-700"
+            >
+              Dismiss
+            </button>
+          </div>
+          <div className="mt-1 text-[11px] text-neutral-500">
+            {interrupted.partial
+              ? "Carries on from its last completed step, keeping what it had already read and changed."
+              : "Died before its first step — this starts the turn again from the prompt."}
+          </div>
+        </div>
+      )}
 
       {/* The gate. Above the composer rather than in the transcript because the
           turn is blocked on it — a prompt that scrolls away is one the user

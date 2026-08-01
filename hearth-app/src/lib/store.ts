@@ -101,10 +101,10 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
     // one rather than look up a key. Before the tree loads: the panel renders
     // as soon as `projectRoot` is set, and an empty chat that fills in a beat
     // later reads as a conversation that was lost.
-    await useChatStore.getState().hydrate(root);
+    await useChatStore.getState().hydrate(root).catch(console.error);
     // Returns as soon as the process is spawned — tsserver then spends a second
     // or two loading the compiler, which nothing here has to wait for.
-    await useLsp.getState().start(root);
+    await useLsp.getState().start(root).catch(console.error);
     const children = await listDir(root);
     set({
       projectRoot: root,
@@ -296,8 +296,11 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
     // no hover, and an agent told there are no type errors. The transcript is
     // read here for the same reason: it lives in the project now, and a restart
     // that skipped this would show an empty chat for a project that has one.
-    await useLsp.getState().start(projectRoot);
-    await useChatStore.getState().hydrate(projectRoot);
+    // Chat first, and neither allowed to take the other down with it: a
+    // tsserver that won't spawn used to mean an empty chat for a project that
+    // has one, and the throw went nowhere anyone would see it.
+    await useChatStore.getState().hydrate(projectRoot).catch(console.error);
+    await useLsp.getState().start(projectRoot).catch(console.error);
     for (const tab of liveTabs) useLsp.getState().touch(tab.path, tab.content);
 
     set({

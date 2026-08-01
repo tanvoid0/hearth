@@ -12,6 +12,32 @@
   margin-left: 3px;
 }
 
+/* The thinking indicator's flame, drawn as three sprite frames stacked in one
+   SVG and shown a third of a cycle each. A sprite flicker rather than a
+   transform or a fade: the tip moves between frames and the base doesn't,
+   which is what makes it read as a flame instead of a wobbling icon. The
+   opacity pairs are what keep the switch hard — a tween between frames would
+   cross-dissolve two flames into a blur. */
+.hearth-flame > g {
+  opacity: 0;
+  animation: hearth-flame 0.72s linear infinite;
+}
+
+.hearth-flame > g:nth-child(2) { animation-delay: 0.24s; }
+.hearth-flame > g:nth-child(3) { animation-delay: 0.48s; }
+
+@keyframes hearth-flame {
+  0%, 33.3% { opacity: 1; }
+  33.4%, 100% { opacity: 0; }
+}
+
+/* Motion off: one frame, lit. The elapsed seconds beside it still count, so
+   nothing that says "working" is lost with the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .hearth-flame > g { animation: none; }
+  .hearth-flame > g:first-child { opacity: 1; }
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;

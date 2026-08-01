@@ -72,6 +72,28 @@ export function stalled(signatures: string[], limit = 3): boolean {
   return signatures.filter((s) => s === last).length >= limit;
 }
 
+/**
+ * Did the current turn already change something on disk?
+ *
+ * Asked of a resumed turn, whose writes happened in a process that no longer
+ * exists — `runAgent` tracks this in a local for a turn it ran itself, and has
+ * to recover it from the messages for one it inherited. It decides whether an
+ * unfinished turn is verified or just ended, so getting it wrong either passes
+ * a broken edit off as success or spends a project-wide type check on a
+ * conversational reply.
+ *
+ * From the last user message on: the list a resume starts from carries every
+ * earlier turn's writes too. With the PLAN step that message is the plan's
+ * acknowledgement rather than the prompt, which is still inside this turn and
+ * still ahead of every tool call in it.
+ */
+export function wroteThisTurn(messages: Array<{ role: string; tool_name?: string }>): boolean {
+  const start = messages.map((m) => m.role).lastIndexOf("user");
+  return messages
+    .slice(start)
+    .some((m) => m.role === "tool" && (m.tool_name === "edit_file" || m.tool_name === "write_file"));
+}
+
 // ponytail: chars-per-token estimate, not a tokeniser. 3 is below the usual ~4
 // for code so the guess errs toward underfilling the window, and it has to
 // leave room for the tool definitions and the reply, neither of which is in

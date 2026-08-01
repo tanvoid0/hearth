@@ -18,11 +18,19 @@ const DB_URL = "sqlite:hearth-chats.db";
 let connection: Promise<Database> | null = null;
 
 export function db(): Promise<Database> {
-  connection ??= Database.load(DB_URL).then(async (open) => {
-    // Idempotent, so running it on every open costs three statements and
-    // removes the need for a migration list that the tests can't reach.
-    for (const statement of SCHEMA) await open.execute(statement);
-    return open;
-  });
+  connection ??= Database.load(DB_URL)
+    .then(async (open) => {
+      // Idempotent, so running it on every open costs three statements and
+      // removes the need for a migration list that the tests can't reach.
+      for (const statement of SCHEMA) await open.execute(statement);
+      return open;
+    })
+    // Forget a connection that failed, or `??=` would hold the rejected promise
+    // for the life of the page: one bad open at startup would mean every later
+    // read and write failing too, on a store whose writes swallow their errors.
+    .catch((e) => {
+      connection = null;
+      throw e;
+    });
   return connection;
 }
