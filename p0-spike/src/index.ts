@@ -3,11 +3,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TASKS } from "./tasks.js";
 import { runOne, type RunLog } from "./harness.js";
+import { listLocalModels, OLLAMA_HOST } from "./ollama.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESULTS_DIR = path.resolve(__dirname, "..", "results");
 
-const DEFAULT_MODELS = ["gpt-oss:latest", "qwen:latest"];
+// Both tool-capable and locally pulled. Keep this list in sync with what's
+// actually installed — preflight() below fails loudly rather than letting a
+// stale name read as "this model scored 0/8".
+const DEFAULT_MODELS = ["qwen3-coder:30b", "llama3.1:8b"];
 
 function parseModels(): string[] {
   const arg = process.argv[2];
@@ -20,8 +24,30 @@ function pct(n: number, d: number): string {
   return `${((n / d) * 100).toFixed(0)}%`;
 }
 
+// A missing model fails identically to a model that can't hold the tool loop:
+// every task errors out and the summary reads 0/8. Check up front instead.
+async function preflight(models: string[]): Promise<void> {
+  let local: string[];
+  try {
+    local = await listLocalModels();
+  } catch (err) {
+    throw new Error(
+      `can't reach Ollama at ${OLLAMA_HOST} — is it running? (${(err as Error).message})`
+    );
+  }
+  const missing = models.filter((m) => !local.includes(m));
+  if (missing.length > 0) {
+    throw new Error(
+      `model(s) not pulled: ${missing.join(", ")}\n` +
+        `  pull with: ${missing.map((m) => `ollama pull ${m}`).join(" && ")}\n` +
+        `  locally available: ${local.join(", ") || "(none)"}`
+    );
+  }
+}
+
 async function main() {
   const models = parseModels();
+  await preflight(models);
   console.log(`Hearth P0 spike — ${models.length} model(s) x ${TASKS.length} task(s) = ${models.length * TASKS.length} runs\n`);
 
   const logs: RunLog[] = [];
@@ -70,6 +96,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error(`\nspike aborted: ${(err as Error).message}`);
   process.exit(1);
 });

@@ -5,7 +5,8 @@
   "version": "0.0.1",
   "description": "De-risk spike: can a local Ollama model hold a multi-step tool-use loop?",
   "scripts": {
-    "spike": "tsx src/index.ts"
+    "spike": "tsx src/index.ts",
+    "probe": "tsx src/tool-probe.ts"
   },
   "devDependencies": {
     "tsx": "^4.19.2",
