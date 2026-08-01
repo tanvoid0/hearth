@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useHearthStore } from "../lib/store";
 import { pickFolder } from "../lib/fs";
 import { defaultWorkspaceDir, scanProjects, type ProjectInfo } from "../lib/projects";
+import { TEMPLATES, type TemplateKind } from "../lib/workspace";
 
 function ProjectCard({ project }: { project: ProjectInfo }) {
   const openFolder = useHearthStore((s) => s.openFolder);
@@ -23,6 +24,7 @@ export function Home() {
   const newProject = useHearthStore((s) => s.newProject);
 
   const [prompt, setPrompt] = useState("");
+  const [kind, setKind] = useState<TemplateKind>("react");
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,7 +45,7 @@ export function Home() {
     setBusy(true);
     setError(null);
     try {
-      await newProject(text);
+      await newProject(text, kind);
     } catch (err) {
       setError((err as Error).message);
       setBusy(false);
@@ -87,8 +89,20 @@ export function Home() {
             placeholder="A todo app with dark mode…"
             className="w-full resize-none rounded border border-neutral-800 bg-neutral-900 p-3 text-[14px] text-neutral-100 outline-none placeholder:text-neutral-600 focus:border-neutral-700"
           />
-          <div className="mt-2 flex items-center justify-between">
-            <span className="text-[11px] text-neutral-600">Enter to create · Shift+Enter for a newline</span>
+          <div className="mt-2 flex items-center gap-1.5">
+            {TEMPLATES.map((t) => (
+              <button
+                key={t.kind}
+                onClick={() => setKind(t.kind)}
+                title={t.hint}
+                className={`rounded px-2 py-0.5 text-[11px] ${
+                  kind === t.kind ? "bg-neutral-700 text-neutral-100" : "bg-neutral-900 text-neutral-500 hover:text-neutral-300"
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+            <span className="ml-auto mr-2 text-[11px] text-neutral-600">Enter to create</span>
             <button
               onClick={() => void create()}
               disabled={!prompt.trim() || busy}

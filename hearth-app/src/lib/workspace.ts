@@ -249,7 +249,115 @@ export default defineConfig(async (env) => {
  * undefined names, wrong argument counts, misspelled DOM props — without asking
  * it to write a single type.
  */
-export function template(name: string): Record<string, string> {
+export type TemplateKind = "react" | "vanilla";
+
+/** What the home screen offers. Two, not ten: a starter nobody picks is a
+ *  starter nobody maintains, and the agent's first job on any of them is to
+ *  replace most of it anyway. */
+export const TEMPLATES: Array<{ kind: TemplateKind; label: string; hint: string }> = [
+  { kind: "react", label: "React", hint: "Vite + React, JSX" },
+  { kind: "vanilla", label: "Vanilla", hint: "Vite, plain JS and CSS" },
+];
+
+/**
+ * What turns the language server on for a plain-JS project. Without a tsconfig
+ * or jsconfig, tsserver files everything under an "inferred project" and
+ * reports no diagnostics at all — which is indistinguishable from a clean
+ * project, for the user and for the agent.
+ */
+function jsconfig(jsx: boolean): string {
+  return (
+    JSON.stringify(
+      {
+        compilerOptions: {
+          // The whole point: type-check .js/.jsx without writing any types.
+          checkJs: true,
+          ...(jsx ? { jsx: "react-jsx" } : {}),
+          module: "esnext",
+          moduleResolution: "bundler",
+          target: "esnext",
+          lib: ["esnext", "dom", "dom.iterable"],
+        },
+        include: ["src"],
+      },
+      null,
+      2,
+    ) + "\n"
+  );
+}
+
+function indexHtml(name: string, entry: string, body: string): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${name}</title>
+${CONSOLE_BRIDGE}  </head>
+  <body>
+${body}
+    <script type="module" src="${entry}"></script>
+  </body>
+</html>
+`;
+}
+
+const GITIGNORE = `node_modules
+dist
+.env
+`;
+
+export function template(name: string, kind: TemplateKind = "react"): Record<string, string> {
+  return kind === "vanilla" ? vanilla(name) : react(name);
+}
+
+/** No framework, no build-time JSX — the same runner, preview and type checking
+ *  with nothing between the file and the page. */
+function vanilla(name: string): Record<string, string> {
+  return {
+    "package.json": JSON.stringify(
+      {
+        name,
+        private: true,
+        version: "0.0.0",
+        type: "module",
+        scripts: { dev: "vite", build: "vite build", preview: "vite preview" },
+        devDependencies: { vite: "^7.0.4" },
+      },
+      null,
+      2,
+    ) + "\n",
+
+    "jsconfig.json": jsconfig(false),
+
+    "index.html": indexHtml(name, "/src/main.js", '    <div id="app"></div>'),
+
+    "src/main.js": `import "./style.css";
+
+document.querySelector("#app").innerHTML = \`
+  <main>
+    <h1>${name}</h1>
+    <p>Empty scaffold — ask the agent to build something here.</p>
+  </main>
+\`;
+`,
+
+    "src/style.css": `:root {
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  padding: 2rem;
+}
+`,
+
+    ".gitignore": GITIGNORE,
+  };
+}
+
+function react(name: string): Record<string, string> {
   return {
     "package.json": JSON.stringify(
       {
@@ -273,40 +381,9 @@ export function template(name: string): Record<string, string> {
       2,
     ) + "\n",
 
-    // What turns the language server on for a plain-JS project. Without a
-    // tsconfig or jsconfig, tsserver files everything under an "inferred
-    // project" and reports no diagnostics at all — which is indistinguishable
-    // from a clean project, for the user and for the agent.
-    "jsconfig.json": JSON.stringify(
-      {
-        compilerOptions: {
-          // The whole point: type-check .js/.jsx without writing any types.
-          checkJs: true,
-          jsx: "react-jsx",
-          module: "esnext",
-          moduleResolution: "bundler",
-          target: "esnext",
-          lib: ["esnext", "dom", "dom.iterable"],
-        },
-        include: ["src"],
-      },
-      null,
-      2,
-    ) + "\n",
+    "jsconfig.json": jsconfig(true),
 
-    "index.html": `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>${name}</title>
-${CONSOLE_BRIDGE}  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
-`,
+    "index.html": indexHtml(name, "/src/main.jsx", '    <div id="root"></div>'),
 
     "vite.config.js": `import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
@@ -349,9 +426,6 @@ body {
 }
 `,
 
-    ".gitignore": `node_modules
-dist
-.env
-`,
+    ".gitignore": GITIGNORE,
   };
 }

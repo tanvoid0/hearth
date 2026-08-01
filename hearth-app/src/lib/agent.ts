@@ -1,5 +1,6 @@
 import { listDir, readTextFile, searchFiles, writeTextFile } from "./fs";
 import { exportedSymbols, formatRepoMap, isSourceFile } from "./repomap";
+import { isSecretFile, redactEnv } from "./secrets";
 import { applyEdits, changedLines, resolveInProject, samePath, type Edit } from "./edit";
 import { CANCELLED, chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
 import { contextLimits, packHistory, stalled } from "./session";
@@ -194,7 +195,11 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
       }
       case "read_file": {
         const target = resolveInProject(root, args?.path);
-        const content = await readTextFile(target);
+        // Keys, never values (build plan §14). Not about trusting the model:
+        // the reply goes into the transcript, which is written to localStorage
+        // and sent back as history on every subsequent turn.
+        const raw = await readTextFile(target);
+        const content = isSecretFile(target) ? redactEnv(raw) : raw;
         return content.length > maxRead
           ? { ok: true, output: content.slice(0, maxRead) + "\n… (file truncated)" }
           : { ok: true, output: content };
@@ -252,7 +257,10 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
         // The cap has to be visible: a model told "12 matches" when there were
         // 300 will edit the twelve and call the job done.
         const capped = hits.length >= MAX_SEARCH_HITS ? `\n… (stopped at ${MAX_SEARCH_HITS} matches — narrow the query)` : "";
-        return { ok: true, output: hits.map((h) => `${h.path}:${h.line}: ${h.text}`).join("\n") + capped };
+        // The line is the match, and in a .env file the match is the secret.
+        // The path still comes back, so "which file sets this" is answerable.
+        const body = hits.map((h) => `${h.path}:${h.line}: ${isSecretFile(h.path) ? "(redacted)" : h.text}`);
+        return { ok: true, output: body.join("\n") + capped };
       }
       case "repo_map": {
         const entries: string[] = [];

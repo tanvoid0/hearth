@@ -50,3 +50,30 @@ test("the scaffold is set up to actually be type-checked", () => {
   assert.ok(dev["@types/react"], "React types are what make checkJs mean anything for JSX");
   assert.ok(dev["@types/react-dom"]);
 });
+
+test("the vanilla template is a runnable project with no framework in it", () => {
+  const files = template("plain-page", "vanilla");
+  // Same contract as the React one: whatever index.html points at must exist,
+  // or the project 404s on its own entry point.
+  const entry = files["index.html"].match(/src="\/(.+?)"/)?.[1];
+  assert.ok(entry && files[entry], `index.html entry ${entry} not in template`);
+
+  const pkg = JSON.parse(files["package.json"]);
+  assert.equal(pkg.name, "plain-page");
+  assert.equal(pkg.dependencies, undefined, "nothing to install at runtime");
+  assert.ok(pkg.scripts.dev, "the runner starts whatever `dev` is");
+
+  // checkJs still on — the type checking is the point of the scaffold, not a
+  // React feature — but no jsx setting, since there is no JSX to transform.
+  const jsconfig = JSON.parse(files["jsconfig.json"]);
+  assert.equal(jsconfig.compilerOptions.checkJs, true);
+  assert.equal(jsconfig.compilerOptions.jsx, undefined);
+});
+
+test("both templates carry the console bridge, which get_errors depends on", () => {
+  // Without it the agent sees vite's build output and nothing about what the
+  // page did at runtime — the failure that leaves a white screen.
+  for (const kind of ["react", "vanilla"] as const) {
+    assert.match(template("x", kind)["index.html"], /__hearthBridge/, kind);
+  }
+});

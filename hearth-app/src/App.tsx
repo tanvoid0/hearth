@@ -11,17 +11,19 @@ import { Home } from "./components/Home";
 import { ProblemsPanel } from "./components/ProblemsPanel";
 import { OutlinePanel } from "./components/OutlinePanel";
 import { HistoryPanel } from "./components/HistoryPanel";
+import { ProjectPanel } from "./components/ProjectPanel";
 import { CommandPalette, type PaletteCommand } from "./components/CommandPalette";
 import { useRunner } from "./lib/runner";
 import { useLsp } from "./lib/lsp";
 
 /** The bottom dock holds one thing at a time (build plan §3). */
-type Dock = "terminal" | "problems" | "outline" | "history" | null;
+type Dock = "terminal" | "problems" | "outline" | "history" | "project" | null;
 
 const DOCK_TABS: Array<{ key: Exclude<Dock, null>; label: string }> = [
   { key: "problems", label: "Problems" },
   { key: "outline", label: "Outline" },
   { key: "history", label: "History" },
+  { key: "project", label: "Project" },
   { key: "terminal", label: "Terminal" },
 ];
 
@@ -184,6 +186,11 @@ function App() {
               {dock === "history" && (
                 <div className="absolute inset-0">
                   <HistoryPanel root={projectRoot} />
+                </div>
+              )}
+              {dock === "project" && (
+                <div className="absolute inset-0">
+                  <ProjectPanel root={projectRoot} />
                 </div>
               )}
             </div>

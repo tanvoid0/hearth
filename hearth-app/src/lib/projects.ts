@@ -1,7 +1,7 @@
 import { homeDir } from "@tauri-apps/api/path";
 import { listDir, readTextFile, writeTextFile } from "./fs";
 import { resolveInProject } from "./edit";
-import { MARKER, slugify, template, uniqueName } from "./workspace";
+import { MARKER, slugify, template, uniqueName, type TemplateKind } from "./workspace";
 
 export interface ProjectInfo {
   name: string;
@@ -55,17 +55,21 @@ export async function scanProjects(workspaceDir: string): Promise<ProjectInfo[]>
  * and return the new root. `write_text_file` creates missing parents, so this
  * needs no mkdir on either side of the IPC boundary.
  */
-export async function createProject(workspaceDir: string, prompt: string): Promise<string> {
+export async function createProject(
+  workspaceDir: string,
+  prompt: string,
+  kind: TemplateKind = "react",
+): Promise<string> {
   const siblings = await listDir(workspaceDir).catch(() => []);
   const name = uniqueName(slugify(prompt), siblings.map((e) => e.name));
   const root = resolveInProject(workspaceDir, name);
 
-  for (const [rel, content] of Object.entries(template(name))) {
+  for (const [rel, content] of Object.entries(template(name, kind))) {
     await writeTextFile(resolveInProject(root, rel), content);
   }
   await writeTextFile(
     resolveInProject(root, MARKER),
-    JSON.stringify({ name, prompt, created: new Date().toISOString() }, null, 2) + "\n",
+    JSON.stringify({ name, prompt, template: kind, created: new Date().toISOString() }, null, 2) + "\n",
   );
 
   return root;

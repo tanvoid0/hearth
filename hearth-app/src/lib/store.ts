@@ -3,6 +3,7 @@ import { createJSONStorage, persist } from "zustand/middleware";
 import { listDir, readTextFile, writeTextFile, type DirEntryInfo } from "./fs";
 import { samePath } from "./edit";
 import { createProject, defaultWorkspaceDir } from "./projects";
+import type { TemplateKind } from "./workspace";
 import { packTab, rebaseTab, type Tab } from "./session";
 import { useRunner } from "./runner";
 import { useLsp } from "./lsp";
@@ -43,7 +44,7 @@ interface HearthState {
   agentLines: Record<string, number[]>;
 
   openFolder: (root: string) => Promise<void>;
-  newProject: (prompt: string) => Promise<void>;
+  newProject: (prompt: string, kind?: TemplateKind) => Promise<void>;
   closeProject: () => void;
   setWorkspaceDir: (dir: string) => void;
   takePendingPrompt: () => string | null;
@@ -101,9 +102,9 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
     });
   },
 
-  newProject: async (prompt: string) => {
+  newProject: async (prompt: string, kind: TemplateKind = "react") => {
     const workspaceDir = get().workspaceDir ?? (await defaultWorkspaceDir());
-    const root = await createProject(workspaceDir, prompt);
+    const root = await createProject(workspaceDir, prompt, kind);
     set({ workspaceDir });
     await get().openFolder(root);
     set({ pendingPrompt: prompt });
