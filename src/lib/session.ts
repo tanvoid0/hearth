@@ -59,20 +59,23 @@ export function packHistory<T extends { role: string }>(messages: T[], budgetCha
  * prefix is sending less than the window holds for a few iterations after each
  * cut; lower means fewer cuts and more wasted window.
  *
- * Measured over a 48-append turn at `num_ctx` 8192 — eight rounds of
- * read/edit/check, reads at the cap:
+ * Prefix changes over 48 appends at `num_ctx` 8192, by how big the tool results
+ * are — sliding is what this replaced:
  *
- * | refill | prefix changes in 48 appends |
- * |---|---|
- * | sliding (no hysteresis) | 48 |
- * | 0.5 | 4 |
- * | 0.6 – 0.9 | 7 |
+ * | tool result size | sliding | this |
+ * |---|---|---|
+ * | at the read cap (12288) | 47 | 47 |
+ * | mixed read/edit/check | 15 | 15 |
+ * | 3000 (a typical source file) | 41 | 14 |
+ * | 600 | 15 | 2 |
  *
- * So the band is flat and almost anything beats sliding. What sets the floor
- * isn't this number: one file read is capped at half the window
- * (`contextLimits`), so two of them can't share a window whatever the refill —
- * 0.5 wins its extra three cuts by holding back half the context, which is the
- * more expensive half of the trade. 0.7 sits on the plateau and keeps more.
+ * The top two rows are the important ones: when a read is near its cap this
+ * buys **nothing**, because `contextLimits` caps one read at half the window,
+ * so two of them cannot share a window at any refill. It pays off on ordinary
+ * file sizes, which is most of them.
+ *
+ * 0.5 halves the cuts again on the 3000 row, but pays for it by holding back
+ * half the context — the more expensive side of the trade, so 0.7.
  */
 const REFILL = 0.7;
 

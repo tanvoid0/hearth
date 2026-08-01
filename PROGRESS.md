@@ -1389,36 +1389,65 @@ reads exhaust it, and gemma4's own recorded traces get there.
 
 `sendWindow` is `packHistory` with hysteresis: `start` moves forward only, and
 only when the window stops fitting — then it cuts back to `REFILL` of the budget
-so the next several appends land inside a window that hasn't moved. Simulated
-over a 48-append turn at the real budget:
-
-| | prefix changes in 48 appends |
-|---|---|
-| sliding (what shipped) | **48** |
-| refill 0.5 | 4 |
-| refill 0.6 – 0.9 | **7** |
-
-The band is flat, which is the useful part: the floor isn't set by the knob but
-by `contextLimits` capping one read at half the window, so two reads can't share
-a window at any refill. 0.5 buys its three extra cuts by holding back half the
-context, so 0.7 sits on the plateau and keeps more. The constant carries that
-table rather than a guess.
+so the next several appends land inside a window that hasn't moved.
 
 Both invariants `packHistory` guards are kept — the system prompt survives every
 cut, and the window never opens on a tool result whose call was cut away, which
 is an answer to a question the model can't see. It lives in
 [`session.ts`](src/lib/session.ts), import-free and unit-tested; `packHistory`
 stays for storage, which is a genuinely different job and was conflated with
-this one once before.
+this one once before. Applied in `app-loop.ts` as well as the app, so the two
+loops can't drift.
 
-**Unmeasured: what it's worth in seconds against a live model.** The 48 → 7 is a
-simulation of the windowing rule, not a timing. Confirming §5's claim needs a
-controlled A/B on a long conversation, which is a bigger measurement than the
-fix. What was checked is that the loop still works through the new send path —
-`pnpm run probe -- gemma4:latest`, both scenarios, `finish` called, edit applied,
-checked and re-checked, 0 repair rounds.
+**How much it moves the prefix depends entirely on how big the tool results
+are**, and the first version of this section claimed otherwise off a broken
+simulation. Prefix changes over 48 appends:
 
-Applied in `app-loop.ts` as well as the app, so the two loops can't drift.
+| tool result size | sliding | this |
+|---|---|---|
+| at the read cap (12288) | 47 | **47** |
+| mixed read/edit/check | 15 | **15** |
+| 3000 (a typical source file) | 41 | **14** |
+| 600 | 15 | **2** |
+
+The top two rows are the honest part: when a read is near its cap this buys
+nothing at all, because `contextLimits` caps one read at half the window, so two
+of them cannot share a window at any refill. It pays off on ordinary file sizes.
+
+**Then measured against the live model, which is where §5's claim lives.**
+`prompt_eval_count` is the wrong metric — it reports the full logical prompt
+whether or not any of it was cached. `prompt_eval_duration` is the one that
+moves, and on gemma4 the mechanism is stark:
+
+| | prompt eval |
+|---|---|
+| cold | 1023ms |
+| byte-identical repeat | **27ms** |
+| same prefix + one append | **74ms** |
+| prefix changed (front dropped) | **999ms** |
+
+So a broken prefix costs ~13–37× a held one, per call. The A/B, real source as
+the payload, model unloaded between arms, 14 appends:
+
+| arm | window moves | calls served from cache | prompt eval, 13 warm calls |
+|---|---|---|---|
+| sliding | 7 | 6/13 | 7.20s, 7.34s |
+| this | 4 | **10/13** | **3.65s, 3.75s** |
+
+Each arm ran twice, first and last, and reproduced its own number — so this is
+the windowing rather than warm-up.
+
+**Two wrong measurements on the way there, both worth keeping.** The first A/B
+reported no difference whatsoever, because at the read cap the two windows make
+*identical* choices — it was comparing the change to itself. The second, at a
+size where they differ, still showed nothing: `prompt_eval_count` pinned at
+~7352 while the sent window grew past 23,000 chars, which is Ollama truncating
+the prompt to fit `num_ctx` and re-cutting the front itself. **No prefix any
+caller chooses survives an overflowing prompt.** That was an artifact of
+synthetic filler tokenising at ~1.4 chars/token; real source measured ~3.7 here,
+so `CHARS_PER_TOKEN = 3` does err toward underfilling as its comment claims. But
+it means the budget is what decides whether any of this works, and a future
+raise to that constant would silently take the caching with it.
 
 ---
 
