@@ -34,4 +34,5 @@ tokio = { version = "1", features = ["sync", "macros"] }
 # shell won't echo, won't line-edit, and won't emit the escape sequences xterm
 # renders. `run_dev`'s pipes are fine for a log; they can't back a prompt.
 portable-pty = "0.9"
+tauri-plugin-sql = { version = "2.4.0", features = ["sqlite"] }
 

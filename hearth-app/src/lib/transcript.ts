@@ -1,12 +1,12 @@
-// Where a conversation lives once it stops living in localStorage, kept
-// import-free (like edit.ts, runlog.ts and session.ts) so `npm test` can
+// The per-project JSONL transcript, which SQLite replaced — kept because it is
+// still read: a project written by the previous version is imported from these
+// files the first time it is opened, and the format has to be parsed correctly
+// to do that. Import-free (like edit.ts and runlog.ts) so `npm test` can
 // exercise it on plain node.
 //
-// One JSON object per line, appended. The append is the point: the old store
-// re-serialised every project's whole transcript on every entry, which is why
-// it had to be trimmed to a 200k-char budget — a quota number that was silently
-// also a history limit. A line at a time has no such ceiling, and a transcript
-// nobody trims is one that can still be read next month.
+// Nothing writes them any more. The files are left where they are rather than
+// deleted: removing a user's only copy of a conversation to tidy up is not a
+// trade worth making.
 
 /** In the project, beside the checkpoint repo. `.hearth` is already skipped by
  *  the file tree, the search and the checkpoint repo's exclude list. */

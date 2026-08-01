@@ -1106,6 +1106,13 @@ bulk rewrite the user starts has no undo boundary — checkpoints are per agent
 turn — and the agent's own edit path already does project-wide changes with one
 behind it. Build it when there's an undo for it, not before.
 
+**The panel has a second mode: `chats`**, which searches every conversation in
+every project rather than this project's files. It lives here rather than in the
+agent panel because it's the same question asked of a different source, and
+because two search boxes in one app is how neither gets found. A hit in another
+project switches to it — the transcript panel shows one project at a time, as
+the agent does.
+
 ### tsserver ships with the app now
 
 Type checking worked under `tauri dev` and reported "unavailable" in a packaged
@@ -1122,7 +1129,7 @@ files, `tsserver.js` and the `lib.*.d.ts` set among them.
 of work, and every project Hearth runs already needs node for the package
 manager and the dev server.
 
-### Transcripts moved into the project
+### Conversations moved to SQLite — P6's persistence item, closed
 
 The 200k-char budget on chat history was a *localStorage quota* number that was
 silently also a history limit — the same shape of bug as `HISTORY_BUDGET` being
@@ -1131,37 +1138,51 @@ conversation in one blob and rewrote all of it on every entry, so the trim
 wasn't a policy about how much history is worth keeping. It was the price of the
 storage.
 
-Transcripts are now `.hearth/chat.jsonl` in the project they belong to, appended
-a line at a time. Nothing is trimmed: `LOAD_LIMIT` bounds what the panel reads
-back and the file keeps the rest.
+It's `tauri-plugin-sql` now, as plan §8's P6 says, one row per entry. Nothing is
+trimmed: `LOAD_LIMIT` bounds what the panel reads back and the table keeps the
+rest. **One database for everything rather than one per project**, which is the
+only reason to prefer a database here at all — the Search panel's *chats* mode
+answers "where did I solve this before" across every project you have, and a
+file per project cannot.
 
-- **The model-facing half stays a snapshot** in `.hearth/chat-session.json` —
-  history, and any turn interrupted mid-flight. That's what it is, and it's
-  already bounded by the context budget; an append-only copy of it would be a
-  log of previous guesses.
-- **A line that won't parse is skipped, not thrown on.** Killing the app
-  mid-append leaves a half-written last line, and losing every conversation in a
-  project to one truncated line would be the worst bug available here. It has
-  its own test, in [`transcript.ts`](hearth-app/src/lib/transcript.ts) with the
-  other import-free parsing modules.
-- **Writes go through a queue.** Appends are dispatched from a synchronous store
-  action, so two entries landing in the same tick would race into the same file.
-  Failures are swallowed: losing the on-disk copy of a turn is bad, losing the
-  turn itself because a write failed is worse.
+- **The schema is `CREATE TABLE IF NOT EXISTS` run from the frontend on every
+  open, not a Rust migration list.** The point is testability: the statements
+  live in [`chatsql.ts`](hearth-app/src/lib/chatsql.ts) and `npm test` executes
+  *those exact strings* against a real SQLite through Node 24's `node:sqlite`.
+  A migration the tests can't reach is a schema nobody checks until the app
+  won't start. (Marked `ponytail:` — the day a column changes, this needs real
+  versioned migrations, and pretending otherwise would corrupt history.)
+- **The schema is a list of statements, not one string with semicolons.** The
+  plugin's `execute` prepares and binds a *single* statement, so the readable
+  version would have created `entries` and silently skipped the index and
+  `sessions`.
+- **`sql:default` doesn't include `allow-execute`.** It grants load, select and
+  close — so every insert, and the schema itself, would have failed at runtime
+  with a permission error. Found by reading the generated ACL manifest rather
+  than by running the app, which is the only reason it was found at all.
+- **A `text` column, populated at insert time**, rather than searching the JSON:
+  a search that matches `"kind":"user"` on every row is worse than no search.
+  Deliberately not FTS5 — that's a virtual table plus triggers to keep in step,
+  for a LIKE over a few thousand rows that is instant.
+- **The query is escaped for LIKE.** `%` and `_` are wildcards, and a search for
+  `100%` that quietly matches everything is the kind of wrong that looks like it
+  worked.
+- **Writes go through a queue.** They're dispatched from a synchronous store
+  action, so two entries landing in the same tick would race. Failures are
+  swallowed: losing the stored copy of a turn is bad, losing the turn itself
+  because a write failed is worse.
 - **Hydration hangs off `rehydrateFromDisk` as well as `openFolder`**, which is
   the one that's easy to miss — reopening the app restores a project without
   going through `openFolder`, and the language server needed the same treatment
-  for the same reason. The comment there now says so for both.
-- An existing conversation in `localStorage` is imported the first time its
-  project is opened, so a version bump doesn't look like lost history.
-
-**Not `tauri-plugin-sql`, which is what the plan names.** What SQLite buys over
-this is queryability across projects, and nothing in the UI asks that question
-yet; what it costs is two dependencies, a migration, and an async rewrite of a
-store that works — reviewed against a running app I'd have to trust rather than
-test. The trim is gone either way, and that was the felt problem. If
-"search my past conversations" gets built, the rows are already one JSON object
-per line to import.
+  for the same reason.
+- **Both older stores are imported once**, per project, on first open: the
+  `localStorage` blob, and the `.hearth/chat.jsonl` files that were the previous
+  answer to this. Their session snapshot comes with them, or the first turn
+  after an upgrade would be sent a conversation the model has never seen. The
+  JSONL files are left on disk rather than deleted — removing someone's only
+  copy of a conversation to tidy up isn't a trade worth making — so
+  [`transcript.ts`](hearth-app/src/lib/transcript.ts) survives as the importer's
+  parser, minus the writer.
 
 ### The split editor — P1's last deferral
 
@@ -1220,12 +1241,10 @@ decisions rather than backlog.
       own control.
 - [x] **P6 · Chat** — streaming chat, code-block and inline-code rendering, and
       transcripts that survive a restart, kept per project.
-- [x] **P6 · unbounded conversation persistence** — transcripts live in the
-      project as appended JSONL and are no longer trimmed (above). **Not
-      `tauri-plugin-sql`**, which is what the plan names: what SQLite adds over
-      this is queryability across projects, and nothing asks that question yet.
-      The reasoning this replaces is kept below, because the part of it that was
-      right is why the file format is one JSON object per line.
+- [x] **P6 · conversation persistence via `tauri-plugin-sql`** — one row per
+      entry, nothing trimmed, and one database across every project so the
+      conversations are searchable from the Search panel (above). That last part
+      is what made SQLite the right answer rather than a heavier file.
 - [~] ~~**P6 · conversation persistence via `tauri-plugin-sql`**~~ — the one item
       still genuinely open, and it stays open on purpose. Transcripts already
       survive restarts in `localStorage`, keyed per project and trimmed to a
@@ -1445,11 +1464,11 @@ cd hearth-app && npm run tauri dev
 ```
 
 ```bash
-# Unit tests (106): path safety, search/replace, session packing, context
+# Unit tests (113): path safety, search/replace, session packing, context
 # sizing, run-state machine, dev-log and missing-package parsing, pull progress,
 # fenced-code splitting, checkpoint name-status, hunk parsing, repo-map
-# extraction, .env redaction, diagnostic folding, transcript framing — plus one
-# that drives a real tsserver end to end
+# extraction, .env redaction, diagnostic folding, transcript framing — plus the
+# chat store's SQL against a real SQLite, and one that drives a real tsserver
 cd hearth-app && npm test
 ```
 

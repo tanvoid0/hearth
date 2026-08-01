@@ -1,8 +1,20 @@
 import { create } from "zustand";
-import { appendTextFile, readTextFile, writeTextFile } from "./fs";
+import { readTextFile } from "./fs";
 import { resolveInProject } from "./edit";
 import { packHistory } from "./session";
-import { decodeEntries, encodeEntry, LOAD_LIMIT, SESSION_REL, TRANSCRIPT_REL } from "./transcript";
+import { db } from "./db";
+import {
+  DELETE_ENTRIES,
+  INSERT_ENTRY,
+  SELECT_ENTRIES,
+  SEARCH_ENTRIES,
+  SEARCH_ENTRIES_IN_PROJECT,
+  SELECT_SESSION,
+  UPSERT_SESSION,
+  likePattern,
+  searchText,
+} from "./chatsql";
+import { decodeEntries, LOAD_LIMIT, SESSION_REL, TRANSCRIPT_REL } from "./transcript";
 import type { ChatMessage } from "./ollama";
 import type { FileChange } from "./gitdiff";
 
@@ -56,20 +68,19 @@ const EMPTY: ChatSession = { entries: [], history: [] };
  *  snapshot on disk, which has to hold whatever the next turn starts from. */
 const HISTORY_BUDGET = 200_000;
 
-/** Where transcripts used to live. Read once per project, to carry an existing
- *  conversation onto disk rather than appear to have lost it. */
+/** The two stores this one replaces, read once per project so an existing
+ *  conversation carries forward rather than appearing to have been lost. */
 const LEGACY_KEY = "hearth-chats";
-
 const transcriptPath = (root: string) => resolveInProject(root, TRANSCRIPT_REL);
-const sessionPath = (root: string) => resolveInProject(root, SESSION_REL);
+const jsonlSessionPath = (root: string) => resolveInProject(root, SESSION_REL);
 
 /**
- * Disk writes, one at a time and in order.
+ * Writes, one at a time and in order.
  *
- * Appends are dispatched from a synchronous store action, so without this two
- * entries landing in the same tick would race each other into the same file.
- * A queue rather than an await at the call site: the panel must not wait on a
- * disk write to render the message the user just sent.
+ * They're dispatched from a synchronous store action, so without this two
+ * entries landing in the same tick would race. A queue rather than an await at
+ * the call site: the panel must not wait on a write to render the message the
+ * user just sent.
  */
 let writes: Promise<unknown> = Promise.resolve();
 function enqueue(write: () => Promise<unknown>): void {
@@ -101,42 +112,45 @@ interface ChatStore {
 
 
 /**
- * Transcripts live in the project they belong to (`.hearth/chat.jsonl`), not in
- * localStorage.
+ * Conversations live in SQLite, one row per entry.
  *
- * The old store put every project's conversation in one blob and rewrote all of
- * it on every entry, so it had to be trimmed to a quota-shaped budget — a
- * storage number that was silently also a history limit. Per project, appended
- * a line at a time, there's nothing to trim: `LOAD_LIMIT` bounds what the panel
- * reads back, and the file keeps the rest.
+ * The store this replaces held every project's conversation in one localStorage
+ * blob and rewrote all of it on every entry, so it had to be trimmed to a
+ * quota-shaped budget — a storage number that was silently also a history
+ * limit. A row at a time there is nothing to trim: `LOAD_LIMIT` bounds what the
+ * panel reads back and the table keeps the rest.
+ *
+ * One database rather than a file per project, which is what a database is for:
+ * `searchChats` can answer "where did I solve this before" across every project
+ * at once, and a file per project can't.
  */
 export const useChatStore = create<ChatStore>()((set, get) => ({
   chats: {},
 
   hydrate: async (root) => {
-    const blob = await readTextFile(transcriptPath(root)).catch(() => null);
-    if (blob === null) {
-      // No file yet. Carry a conversation this project had under the old store
-      // rather than let a version bump look like lost history.
-      const imported = legacyChat(root);
+    const conn = await db();
+    const rows = (await conn.select(SELECT_ENTRIES, [root, LOAD_LIMIT])) as Array<{ json: string }>;
+    if (rows.length === 0) {
+      // Nothing stored for this project. Carry forward a conversation held by
+      // either store this one replaces, so an upgrade doesn't read as lost
+      // history — then it's rows like everything else.
+      const imported = (await jsonlChat(root)) ?? legacyChat(root);
       if (imported) {
-        enqueue(() => writeTextFile(transcriptPath(root), imported.entries.map(encodeEntry).join("")));
+        for (const entry of imported.entries) enqueue(() => insert(root, entry));
         enqueue(() => writeSession(root, imported));
       }
       set((s) => ({ chats: { ...s.chats, [root]: imported ?? EMPTY } }));
       return;
     }
-    const { entries } = decodeEntries<Entry>(blob, LOAD_LIMIT);
-    const session = await readTextFile(sessionPath(root))
-      .then((text) => JSON.parse(text) as Pick<ChatSession, "history" | "pending">)
-      .catch(() => ({ history: [] as ChatMessage[], pending: undefined }));
-    set((s) => ({
-      chats: { ...s.chats, [root]: { entries, history: session.history ?? [], pending: session.pending } },
-    }));
+    // Newest-first out of SQL so the limit takes the newest; the panel reads
+    // top to bottom.
+    const entries = rows.map((r) => JSON.parse(r.json) as Entry).reverse();
+    const session = await loadSession(root);
+    set((s) => ({ chats: { ...s.chats, [root]: { entries, ...session } } }));
   },
 
   addEntry: (root, entry) => {
-    enqueue(() => appendTextFile(transcriptPath(root), encodeEntry(entry)));
+    enqueue(() => insert(root, entry));
     set((s) => {
       const cur = s.chats[root] ?? EMPTY;
       return { chats: { ...s.chats, [root]: { ...cur, entries: [...cur.entries, entry] } } };
@@ -176,25 +190,78 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
 
   clearChat: (root) => {
     set((s) => ({ chats: { ...s.chats, [root]: EMPTY } }));
-    // Truncate rather than delete: New chat means this conversation is over,
-    // not that the project never had one, and an empty file says so without a
-    // delete command existing anywhere in the app.
-    enqueue(() => writeTextFile(transcriptPath(root), ""));
+    // This project's rows only — the table holds every project, and New chat
+    // means this conversation is over, not everyone's.
+    enqueue(async () => (await db()).execute(DELETE_ENTRIES, [root]));
     enqueue(() => writeSession(root, EMPTY));
   },
 }));
 
-function writeSession(root: string, chat: ChatSession | undefined): Promise<void> {
+/**
+ * Search every conversation, or one project's.
+ *
+ * The reason this store is a database. Matching is on the text lifted out of
+ * each entry at insert time rather than on its JSON — see `searchText`.
+ */
+export interface ChatHit {
+  root: string;
+  kind: string;
+  text: string;
+}
+
+export async function searchChats(query: string, root: string | null, limit = 100): Promise<ChatHit[]> {
+  const conn = await db();
+  const pattern = likePattern(query);
+  return root
+    ? conn.select<ChatHit[]>(SEARCH_ENTRIES_IN_PROJECT, [root, pattern, limit])
+    : conn.select<ChatHit[]>(SEARCH_ENTRIES, [pattern, limit]);
+}
+
+async function insert(root: string, entry: Entry): Promise<void> {
+  const conn = await db();
+  const record = entry as unknown as Record<string, unknown>;
+  await conn.execute(INSERT_ENTRY, [root, entry.kind, searchText(record), JSON.stringify(entry)]);
+}
+
+async function loadSession(root: string): Promise<Pick<ChatSession, "history" | "pending">> {
+  const conn = await db();
+  const rows = (await conn.select(SELECT_SESSION, [root])) as Array<{ json: string }>;
+  try {
+    const stored = JSON.parse(rows[0]?.json ?? "{}") as Pick<ChatSession, "history" | "pending">;
+    return { history: stored.history ?? [], pending: stored.pending };
+  } catch {
+    return { history: [] };
+  }
+}
+
+async function writeSession(root: string, chat: ChatSession | undefined): Promise<void> {
   const { history = [], pending } = chat ?? EMPTY;
-  return writeTextFile(
-    sessionPath(root),
+  const conn = await db();
+  await conn.execute(UPSERT_SESSION, [
+    root,
     JSON.stringify({
       history: packHistory(history, HISTORY_BUDGET),
       ...(pending
         ? { pending: pending.partial ? { ...pending, partial: packHistory(pending.partial, HISTORY_BUDGET) } : pending }
         : {}),
     }),
-  );
+  ]);
+}
+
+/** The per-project JSONL this store replaced. Left on disk rather than deleted:
+ *  removing a user's only copy of a conversation to tidy up is not a trade
+ *  worth making, and an import that ran once will find no rows to re-add. */
+async function jsonlChat(root: string): Promise<ChatSession | null> {
+  const blob = await readTextFile(transcriptPath(root)).catch(() => null);
+  if (blob === null) return null;
+  const { entries } = decodeEntries<Entry>(blob, LOAD_LIMIT);
+  if (entries.length === 0) return null;
+  // The history too, not just the transcript: without it the first turn after
+  // an upgrade would be sent a conversation the model has never seen.
+  const session = await readTextFile(jsonlSessionPath(root))
+    .then((text) => JSON.parse(text) as Pick<ChatSession, "history" | "pending">)
+    .catch((): Pick<ChatSession, "history" | "pending"> => ({ history: [] }));
+  return { entries, history: session.history ?? [], pending: session.pending };
 }
 
 /** The pre-file store, read straight from localStorage rather than through a

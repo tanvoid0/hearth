@@ -62,22 +62,6 @@ fn write_text_file(path: String, contents: String) -> Result<(), String> {
     fs::write(&path, contents).map_err(|e| format!("{}: {}", path, e))
 }
 
-/// Append, for the chat transcript. Rewriting a whole conversation to add one
-/// line is what made the old store need a size budget; this is the same file
-/// API without that cost.
-#[tauri::command]
-fn append_text_file(path: String, contents: String) -> Result<(), String> {
-    if let Some(parent) = Path::new(&path).parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("{}: {}", path, e))?;
-    file.write_all(contents.as_bytes()).map_err(|e| format!("{}: {}", path, e))
-}
-
 fn ollama_host() -> String {
     std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".into())
 }
@@ -1572,11 +1556,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // No migration list: the schema is `CREATE TABLE IF NOT EXISTS` run from
+        // the frontend on every open, so it lives in chatsql.ts where the tests
+        // can execute the same strings against a real SQLite.
+        .plugin(tauri_plugin_sql::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             list_dir,
             read_text_file,
             write_text_file,
-            append_text_file,
             ollama_models,
             ollama_ps,
             ollama_unload,
