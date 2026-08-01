@@ -95,9 +95,21 @@ function HunkStrip({ diff, root }: { diff: DiffView & { sha: string }; root: str
   );
 }
 
-export function EditorPane() {
+/**
+ * `path` pins this pane to one file — the split. Without it the pane follows
+ * `activePath`, which is the main editor.
+ *
+ * The two share Monaco's model registry, keyed by path, so splitting a file
+ * against itself is two views of one buffer rather than two buffers racing to
+ * save. What the split pane deliberately doesn't do is take part in anything
+ * global: the diff takes over the main pane, and a go-to-definition jump moves
+ * the main pane, because both would otherwise fire twice and the second one
+ * would win.
+ */
+export function EditorPane({ path }: { path?: string } = {}) {
+  const isSplit = path !== undefined;
   const tabs = useHearthStore((s) => s.tabs);
-  const activePath = useHearthStore((s) => s.activePath);
+  const activePath = useHearthStore((s) => (path !== undefined ? path : s.activePath));
   const setTabContent = useHearthStore((s) => s.setTabContent);
   const diff = useHearthStore((s) => s.diff);
   const closeDiff = useHearthStore((s) => s.closeDiff);
@@ -186,7 +198,7 @@ export function EditorPane() {
   }
 
   useEffect(() => {
-    if (!reveal) return;
+    if (!reveal || isSplit) return;
     // Already mounted on the right file — no tab switch to wait for.
     if (editorRef.current && applyReveal(editorRef.current)) return;
     const name = reveal.path.split(/[\\/]/).pop() ?? reveal.path;
@@ -198,7 +210,7 @@ export function EditorPane() {
 
   // Takes over the pane rather than opening as a tab: a diff is a view of a
   // past commit, not a file you can save, and a tab implies both.
-  if (diff) {
+  if (diff && !isSplit) {
     return (
       <div className="flex h-full flex-col">
         <div className="flex h-7 shrink-0 items-center gap-2 border-b border-neutral-800 bg-neutral-900 px-2 text-[11px]">

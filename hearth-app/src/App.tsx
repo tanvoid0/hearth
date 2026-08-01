@@ -46,6 +46,7 @@ function App() {
   // A type error with the dock collapsed is otherwise invisible until you open
   // the file — the same argument as the preview's console badge.
   const problemCount = useLsp((s) => s.problems.length);
+  const splitPath = useHearthStore((s) => s.splitPath);
   const references = useLsp((s) => s.references);
 
   // Shift+F12 in the editor puts its answer in a panel that may not be open —
@@ -57,6 +58,14 @@ function App() {
   function toggleDock(which: Exclude<Dock, null>) {
     if (which === "terminal") setTerminalUsed(true);
     setDock((current) => (current === which ? null : which));
+  }
+
+  // Pins the file you are looking at into a second pane, so moving around in
+  // the main one leaves it in view. Reads the store at call time rather than
+  // closing over `splitPath`, so the keybinding can't go stale.
+  function toggleSplit() {
+    const { splitPath: current, activePath, setSplit } = useHearthStore.getState();
+    setSplit(current ? null : activePath);
   }
 
   async function handleOpenFolder() {
@@ -102,6 +111,11 @@ function App() {
         setDock("search");
         return;
       }
+      if (e.key === "\\") {
+        e.preventDefault();
+        toggleSplit();
+        return;
+      }
       if (e.key.toLowerCase() !== "s") return;
       e.preventDefault();
       const { activePath, saveTab } = useHearthStore.getState();
@@ -123,6 +137,7 @@ function App() {
       { label: "Open folder…", run: () => void handleOpenFolder() },
       { label: "Compare with last checkpoint", run: () => void compareWithCheckpoint() },
       ...DOCK_TABS.map((tab) => ({ label: `Toggle ${tab.label.toLowerCase()}`, run: () => toggleDock(tab.key) })),
+      { label: "Toggle split editor", run: toggleSplit },
       { label: "Toggle preview", run: () => setPreviewOpen((v) => !v) },
       { label: "Toggle agent panel", run: () => setChatOpen((v) => !v) },
       { label: "Run dev server", run: () => projectRoot && void useRunner.getState().start(projectRoot) },
@@ -193,8 +208,27 @@ function App() {
 
         <main className="flex min-w-0 flex-1 flex-col">
           <TabBar />
-          <div className="min-h-0 flex-1">
-            <EditorPane />
+          <div className="flex min-h-0 flex-1">
+            <div className="min-w-0 flex-1">
+              <EditorPane />
+            </div>
+            {splitPath && (
+              <div className="flex min-w-0 flex-1 flex-col border-l border-neutral-800">
+                <div className="flex h-7 shrink-0 items-center gap-2 border-b border-neutral-800 bg-neutral-900 px-2 text-[11px]">
+                  <span className="truncate text-neutral-400">{splitPath.split(/[\/]/).pop()}</span>
+                  <button
+                    onClick={() => useHearthStore.getState().setSplit(null)}
+                    title="Close split"
+                    className="ml-auto shrink-0 rounded px-1.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="min-h-0 flex-1">
+                  <EditorPane path={splitPath} />
+                </div>
+              </div>
+            )}
           </div>
           {previewOpen && <PreviewPane />}
           {(terminalUsed || dock !== null) && (
