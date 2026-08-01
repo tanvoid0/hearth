@@ -1,6 +1,6 @@
 import { listDir, readTextFile, searchFiles, writeTextFile } from "./fs";
 import { exportedSymbols, formatRepoMap, isSourceFile } from "./repomap";
-import { applyEdits, resolveInProject, samePath, type Edit } from "./edit";
+import { applyEdits, changedLines, resolveInProject, samePath, type Edit } from "./edit";
 import { CANCELLED, chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
 import { contextLimits, packHistory, stalled } from "./session";
 import { useHearthStore } from "./store";
@@ -225,6 +225,9 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
         // in memory, so a write it doesn't hear about is a file it keeps
         // type-checking at its previous contents.
         useLsp.getState().touch(target, content);
+        // Before syncFromDisk, which replaces the tab's content — after it,
+        // there's nothing left to compare against.
+        useHearthStore.getState().markAgentWrite(target, changedLines(before, content));
         await useHearthStore.getState().syncFromDisk(target);
         return { ok: true, output: `applied ${edits.length} edit(s) to ${args?.path}` };
       }
@@ -238,6 +241,7 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
         }
         await writeTextFile(target, args?.content ?? "");
         useLsp.getState().touch(target, args?.content ?? "");
+        useHearthStore.getState().markAgentWrite(target, changedLines("", args?.content ?? ""));
         await useHearthStore.getState().syncFromDisk(target);
         return { ok: true, output: `created ${args?.path}` };
       }

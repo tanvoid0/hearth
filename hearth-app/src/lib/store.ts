@@ -16,6 +16,9 @@ export interface DiffView {
   label: string;
   original: string;
   modified: string;
+  /** The checkpoint this diff came from — what the per-hunk revert needs to
+   *  ask git for the hunks. */
+  sha: string;
 }
 
 interface HearthState {
@@ -31,6 +34,10 @@ interface HearthState {
   pendingPrompt: string | null;
   /** Takes over the editor pane while a checkpoint file is under review. */
   diff: DiffView | null;
+  /** Lines the agent last wrote, by file, for the editor decoration. A change
+   *  you didn't type is otherwise invisible until you go looking for it. Not
+   *  persisted: it describes what just happened, not the session. */
+  agentLines: Record<string, number[]>;
 
   openFolder: (root: string) => Promise<void>;
   newProject: (prompt: string) => Promise<void>;
@@ -47,6 +54,12 @@ interface HearthState {
   rehydrateFromDisk: () => Promise<void>;
   openDiff: (diff: DiffView) => void;
   closeDiff: () => void;
+  markAgentWrite: (path: string, lines: number[]) => void;
+}
+
+function omit<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const { [key]: _dropped, ...rest } = record;
+  return rest;
 }
 
 export const useHearthStore = create<HearthState>()(persist((set, get) => ({
@@ -58,6 +71,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
   workspaceDir: null,
   pendingPrompt: null,
   diff: null,
+  agentLines: {},
 
   // Every way in and out of a project routes through openFolder/closeProject,
   // so stopping the dev server here covers all of them — a server left running
@@ -75,6 +89,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
       tabs: [],
       activePath: null,
       diff: null,
+      agentLines: {},
     });
   },
 
@@ -89,7 +104,15 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
   closeProject: () => {
     void useRunner.getState().stop();
     void useLsp.getState().stop();
-    set({ projectRoot: null, dirChildren: {}, expandedDirs: new Set(), tabs: [], activePath: null, diff: null });
+    set({
+      projectRoot: null,
+      dirChildren: {},
+      expandedDirs: new Set(),
+      tabs: [],
+      activePath: null,
+      diff: null,
+      agentLines: {},
+    });
   },
 
   setWorkspaceDir: (dir: string) => set({ workspaceDir: dir }),
@@ -143,8 +166,15 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
     useLsp.getState().touch(path, content);
     set((state) => ({
       tabs: state.tabs.map((t) => (t.path === path ? { ...t, content } : t)),
+      // Typing in the file is the acknowledgement: the highlight has done its
+      // job the moment you're working in there, and leaving it up turns it into
+      // background colour nobody reads.
+      agentLines: state.agentLines[path] ? omit(state.agentLines, path) : state.agentLines,
     }));
   },
+
+  markAgentWrite: (path: string, lines: number[]) =>
+    set((state) => ({ agentLines: { ...state.agentLines, [path]: lines } })),
 
   saveTab: async (path: string) => {
     const tab = get().tabs.find((t) => t.path === path);

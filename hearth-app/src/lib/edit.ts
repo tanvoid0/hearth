@@ -47,6 +47,36 @@ export function samePath(a: string, b: string): boolean {
   return norm(a) === norm(b);
 }
 
+/**
+ * The 1-based lines of `after` that differ from `before`.
+ *
+ * Trims the common prefix and suffix rather than running a real diff: what this
+ * feeds is a decoration saying "the agent touched here", and the honest answer
+ * to "which lines" for a decoration is the span that changed. A pure deletion
+ * returns nothing, which is right — there's no line left to mark.
+ *
+ * ponytail: one span, so two edits far apart in a file mark everything between
+ * them. Run a real line diff if that ever reads as noise.
+ */
+export function changedLines(before: string, after: string): number[] {
+  const a = before.split("\n");
+  const b = after.split("\n");
+
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+
+  let endA = a.length - 1;
+  let endB = b.length - 1;
+  while (endA >= start && endB >= start && a[endA] === b[endB]) {
+    endA--;
+    endB--;
+  }
+
+  const lines: number[] = [];
+  for (let i = start; i <= endB; i++) lines.push(i + 1);
+  return lines;
+}
+
 function normalizeWhitespace(s: string): string {
   return s.replace(/[ \t]+/g, " ").replace(/\s+$/gm, "").trim();
 }

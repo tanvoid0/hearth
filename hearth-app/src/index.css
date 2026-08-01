@@ -1,5 +1,17 @@
 @import "tailwindcss";
 
+/* Lines the agent last wrote, marked in the editor until you type there
+   yourself. A change you didn't make is otherwise invisible unless you already
+   know where to look. */
+.hearth-agent-line {
+  background: rgba(56, 189, 248, 0.09);
+}
+
+.hearth-agent-gutter {
+  border-left: 2px solid rgba(56, 189, 248, 0.55);
+  margin-left: 3px;
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import { writeTextFile } from "./fs";
-import { resolveInProject } from "./edit";
-import { parseNameStatus, type FileChange } from "./gitdiff";
+import { readTextFile, writeTextFile } from "./fs";
+import { applyEdits, resolveInProject } from "./edit";
+import { parseHunks, parseNameStatus, type FileChange, type Hunk } from "./gitdiff";
 
 // Checkpoints via git, per build plan §7: don't build a versioning system.
 // Every agent turn that changes something becomes a commit in a repo living at
@@ -60,6 +60,32 @@ export async function commitAll(root: string, message: string): Promise<string |
   return (await git(root, "rev-parse", "HEAD")).stdout.trim();
 }
 
+export interface Checkpoint {
+  sha: string;
+  /** The prompt that produced the turn — `commitAll` uses it as the message. */
+  message: string;
+  when: string;
+}
+
+/**
+ * Every checkpoint, newest first — build plan §13's timeline.
+ *
+ * The repo has held this all along; until now the only way to reach a
+ * checkpoint was the card in the transcript, so clearing the chat hid history
+ * git still had. NUL-separated because a commit message is the user's prompt
+ * and can contain anything, including the separators a friendlier format would
+ * have used.
+ */
+export async function listCheckpoints(root: string, max: number): Promise<Checkpoint[]> {
+  const out = await git(root, "log", `--max-count=${max}`, "--format=%H%x00%s%x00%cr");
+  if (out.code !== 0) return []; // no repo yet: the agent has never run here
+  return out.stdout
+    .split("\n")
+    .map((line) => line.replace(/\r$/, "").split("\0"))
+    .filter((fields) => fields.length === 3)
+    .map(([sha, message, when]) => ({ sha, message, when }));
+}
+
 /** `git show` rather than `diff <sha>~ <sha>`: it handles the root commit,
  *  which has no parent to diff against. */
 export async function changedFiles(root: string, sha: string): Promise<FileChange[]> {
@@ -78,6 +104,38 @@ export async function fileVersions(root: string, sha: string, path: string): Pro
     before: before.code === 0 ? before.stdout : "",
     after: after.code === 0 ? after.stdout : "",
   };
+}
+
+/** The hunks of one file's change at a checkpoint. `git show` again rather than
+ *  `diff`, for the same reason as `changedFiles`: it handles the root commit. */
+export async function fileHunks(root: string, sha: string, path: string): Promise<Hunk[]> {
+  return parseHunks((await git(root, "show", "--format=", "-U3", sha, "--", path)).stdout);
+}
+
+/**
+ * Undo one hunk in the *working* file — build plan §8's reject-per-hunk.
+ *
+ * Against the file on disk, not the commit: the checkpoint is history and stays
+ * as it is. What's being asked is "keep the turn, minus this part", which is a
+ * change to the file the user has now.
+ *
+ * Reuses the agent's own search/replace matcher rather than applying a patch by
+ * line number, which means it inherits the tolerance for whitespace drift and,
+ * more importantly, the refusal to fuzzy-apply: if the file moved on since the
+ * checkpoint, this fails loudly instead of reverting the wrong lines.
+ */
+export async function revertHunk(root: string, path: string, hunk: Hunk): Promise<void> {
+  // No context and nothing added: there's no text to search for, and an empty
+  // search matches at position zero.
+  if (hunk.after === "") throw new Error("this hunk only removed lines — restore the whole checkpoint instead");
+
+  const target = resolveInProject(root, path);
+  const current = await readTextFile(target);
+  const { content, failures } = applyEdits(current, [{ search: hunk.after, replace: hunk.before }]);
+  if (failures.length > 0) {
+    throw new Error("this hunk no longer matches the file — it has changed since the checkpoint");
+  }
+  await writeTextFile(target, content);
 }
 
 /** Put the work tree back to how it looked right after this checkpoint.

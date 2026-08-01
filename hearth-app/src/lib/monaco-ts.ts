@@ -1,6 +1,8 @@
 import * as monaco from "monaco-editor";
 import { request, useLsp } from "./lsp";
 import { normalizePath, problemsIn } from "./problems";
+import { readTextFile, writeTextFile } from "./fs";
+import { useHearthStore } from "./store";
 
 /**
  * Monaco's side of the language server: markers in the editor, and hover,
@@ -103,6 +105,80 @@ function toSymbols(node: any): monaco.languages.DocumentSymbol[] {
   ];
 }
 
+/** Monaco's own keybinding constants, re-exported so components that import
+ *  Monaco only as a type don't have to hardcode the numbers. */
+export const SHIFT_F12 = monaco.KeyMod.Shift | monaco.KeyCode.F12;
+
+/** tsserver's rename result for one file: the file, and every span in it. */
+interface RenameGroup {
+  file: string;
+  locs: Array<{ start: { line: number; offset: number }; end: { line: number; offset: number } }>;
+}
+
+/**
+ * Apply a rename to a file that isn't open in the editor.
+ *
+ * The awkward half of rename, and the half that makes it worth having: Monaco
+ * can only edit models it holds, which here means open tabs — so a workspace
+ * edit alone would rename the symbol in the two files you happen to be looking
+ * at and quietly leave the rest of the project referring to the old name.
+ * Spans are applied last-first so the earlier ones keep their offsets.
+ */
+async function renameOnDisk(group: RenameGroup, newName: string): Promise<void> {
+  const content = await readTextFile(group.file);
+  const lines = content.split("\n");
+
+  const spans = [...group.locs].sort(
+    (a, b) => b.start.line - a.start.line || b.start.offset - a.start.offset,
+  );
+  for (const span of spans) {
+    const i = span.start.line - 1;
+    if (i < 0 || i >= lines.length) continue; // the file moved on under us
+    lines[i] = lines[i].slice(0, span.start.offset - 1) + newName + lines[i].slice(span.end.offset - 1);
+  }
+
+  const next = lines.join("\n");
+  await writeTextFile(group.file, next);
+  useLsp.getState().touch(group.file, next);
+  await useHearthStore.getState().syncFromDisk(group.file);
+}
+
+/**
+ * Find-all-references, into the dock rather than Monaco's peek widget.
+ *
+ * Same reason as the rename above, from the other direction: the peek can only
+ * render locations in models Monaco already has, so it would show references in
+ * open tabs and silently omit every other one — which for this question is the
+ * wrong half of the answer.
+ */
+export async function findReferences(editor: monaco.editor.ICodeEditor): Promise<void> {
+  const model = editor.getModel();
+  const position = editor.getPosition();
+  const file = model && fileOf(model);
+  if (!file || !position) return;
+
+  useLsp.setState({ references: { symbol: "", items: [], loading: true } });
+  const body = await request<{ symbolName?: string; refs?: any[] }>(
+    "references",
+    { file, line: position.lineNumber, offset: position.column },
+    15_000,
+  );
+
+  useLsp.setState({
+    references: {
+      symbol: body?.symbolName ?? "",
+      loading: false,
+      items: (body?.refs ?? []).map((ref) => ({
+        path: ref.file,
+        line: ref.start?.line ?? 1,
+        column: ref.start?.offset ?? 1,
+        text: String(ref.lineText ?? "").trim(),
+        isDefinition: !!ref.isDefinition,
+      })),
+    },
+  });
+}
+
 let registered = false;
 
 /**
@@ -125,6 +201,9 @@ export function registerLanguageFeatures() {
     hovers: false,
     documentSymbols: false,
     definitions: false,
+    // Monaco's own reference provider is left off and not replaced — see
+    // `findReferences`, which answers the same question without the peek
+    // widget's open-tabs-only limit.
     references: false,
     documentHighlights: true,
     rename: false,
@@ -177,6 +256,44 @@ export function registerLanguageFeatures() {
         return null;
       }
       return spans.map((span) => ({ uri: known.uri, range: toRange(span) }));
+    },
+  });
+
+  // F2. The workspace edit covers open tabs; everything else is written
+  // straight to disk by `renameOnDisk`, because a rename that only reaches the
+  // files you happen to have open is worse than no rename at all.
+  monaco.languages.registerRenameProvider(languages, {
+    async provideRenameEdits(model, position, newName) {
+      const file = fileOf(model);
+      if (!file) return null;
+      const info = await request<{ info?: any; locs?: RenameGroup[] }>(
+        "rename",
+        { file, line: position.lineNumber, offset: position.column, findInComments: false, findInStrings: false },
+        15_000,
+      );
+      if (!info?.info?.canRename) {
+        return { edits: [], rejectReason: info?.info?.localizedErrorMessage ?? "this can't be renamed" };
+      }
+
+      const edits: monaco.languages.IWorkspaceTextEdit[] = [];
+      const offDisk: RenameGroup[] = [];
+      for (const group of info.locs ?? []) {
+        const known = models.get(normalizePath(group.file));
+        if (known && !known.isDisposed()) {
+          for (const loc of group.locs) {
+            edits.push({ resource: known.uri, versionId: undefined, textEdit: { range: toRange(loc), text: newName } });
+          }
+        } else {
+          offDisk.push(group);
+        }
+      }
+
+      // Sequential rather than parallel: each one ends in a store update that
+      // re-reads the file tree, and racing those produces a tree built from
+      // whichever listing came back last.
+      for (const group of offDisk) await renameOnDisk(group, newName);
+
+      return { edits };
     },
   });
 

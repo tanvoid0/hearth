@@ -128,6 +128,7 @@ function CheckpointCard({ entry, root }: { entry: Extract<Entry, { kind: "checkp
         label: `checkpoint ${short}`,
         original: before,
         modified: after,
+        sha: entry.sha,
       });
     } catch (err) {
       report((err as Error).message);

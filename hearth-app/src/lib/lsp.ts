@@ -88,6 +88,22 @@ function requestErrors(command: string, args: unknown, timeoutMs: number): Promi
   });
 }
 
+export interface ReferenceItem {
+  path: string;
+  line: number;
+  column: number;
+  text: string;
+  isDefinition: boolean;
+}
+
+/** The last find-all-references, shown in the dock. Null means nobody has
+ *  asked, which is different from "asked and found nothing". */
+export interface ReferenceResult {
+  symbol: string;
+  items: ReferenceItem[];
+  loading: boolean;
+}
+
 interface LspState {
   status: CheckStatus;
   diags: Diags;
@@ -97,6 +113,10 @@ interface LspState {
   /** Set by go-to-definition when the target is in a file that isn't open yet;
    *  consumed by EditorPane once that file's editor mounts. */
   reveal: { path: string; line: number; column: number } | null;
+  references: ReferenceResult | null;
+  clearReferences: () => void;
+  /** Ask the editor to show a position, opening the file if it isn't already. */
+  jumpTo: (path: string, line: number, column: number) => void;
 
   start: (root: string) => Promise<void>;
   stop: () => Promise<void>;
@@ -158,6 +178,10 @@ export const useLsp = create<LspState>((set, get) => ({
   diags: {},
   problems: [],
   reveal: null,
+  references: null,
+
+  clearReferences: () => set({ references: null }),
+  jumpTo: (path, line, column) => set({ reveal: { path, line, column } }),
 
   start: async (root: string) => {
     await get().stop();
@@ -183,7 +207,7 @@ export const useLsp = create<LspState>((set, get) => ({
     pending.clear();
     completed.clear();
     await invoke("ts_stop").catch(() => {});
-    set({ status: "unavailable", diags: {}, problems: [], reveal: null });
+    set({ status: "unavailable", diags: {}, problems: [], reveal: null, references: null });
   },
 
   touch: (path: string, content: string) => {

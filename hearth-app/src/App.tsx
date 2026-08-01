@@ -9,12 +9,21 @@ import { PreviewPane } from "./components/PreviewPane";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { Home } from "./components/Home";
 import { ProblemsPanel } from "./components/ProblemsPanel";
+import { OutlinePanel } from "./components/OutlinePanel";
+import { HistoryPanel } from "./components/HistoryPanel";
 import { CommandPalette, type PaletteCommand } from "./components/CommandPalette";
 import { useRunner } from "./lib/runner";
 import { useLsp } from "./lib/lsp";
 
 /** The bottom dock holds one thing at a time (build plan §3). */
-type Dock = "terminal" | "problems" | null;
+type Dock = "terminal" | "problems" | "outline" | "history" | null;
+
+const DOCK_TABS: Array<{ key: Exclude<Dock, null>; label: string }> = [
+  { key: "problems", label: "Problems" },
+  { key: "outline", label: "Outline" },
+  { key: "history", label: "History" },
+  { key: "terminal", label: "Terminal" },
+];
 
 function App() {
   const projectRoot = useHearthStore((s) => s.projectRoot);
@@ -32,6 +41,13 @@ function App() {
   // A type error with the dock collapsed is otherwise invisible until you open
   // the file — the same argument as the preview's console badge.
   const problemCount = useLsp((s) => s.problems.length);
+  const references = useLsp((s) => s.references);
+
+  // Shift+F12 in the editor puts its answer in a panel that may not be open —
+  // and a keystroke that appears to do nothing is one nobody presses twice.
+  useEffect(() => {
+    if (references) setDock("outline");
+  }, [references]);
 
   function toggleDock(which: Exclude<Dock, null>) {
     if (which === "terminal") setTerminalUsed(true);
@@ -73,8 +89,7 @@ function App() {
         if (activePath) void saveTab(activePath);
       } },
       { label: "Open folder…", run: () => void handleOpenFolder() },
-      { label: "Toggle terminal", run: () => toggleDock("terminal") },
-      { label: "Toggle problems", run: () => toggleDock("problems") },
+      ...DOCK_TABS.map((tab) => ({ label: `Toggle ${tab.label.toLowerCase()}`, run: () => toggleDock(tab.key) })),
       { label: "Toggle preview", run: () => setPreviewOpen((v) => !v) },
       { label: "Toggle agent panel", run: () => setChatOpen((v) => !v) },
       { label: "Run dev server", run: () => projectRoot && void useRunner.getState().start(projectRoot) },
@@ -111,23 +126,19 @@ function App() {
           >
             Preview{running && !previewOpen ? " ●" : ""}
           </button>
-          <button
-            onClick={() => toggleDock("problems")}
-            className={`rounded px-2.5 py-1 text-[12px] hover:bg-neutral-700 ${
-              dock === "problems" ? "bg-neutral-700 text-white" : "bg-neutral-800 text-neutral-200"
-            }`}
-          >
-            Problems
-            {problemCount > 0 && <span className="ml-1.5 text-red-400">{problemCount}</span>}
-          </button>
-          <button
-            onClick={() => toggleDock("terminal")}
-            className={`rounded px-2.5 py-1 text-[12px] hover:bg-neutral-700 ${
-              dock === "terminal" ? "bg-neutral-700 text-white" : "bg-neutral-800 text-neutral-200"
-            }`}
-          >
-            Terminal
-          </button>
+          {DOCK_TABS.map(({ key, label }) => (
+            <button
+              key={key}
+              onClick={() => toggleDock(key)}
+              className={`rounded px-2.5 py-1 text-[12px] hover:bg-neutral-700 ${
+                dock === key ? "bg-neutral-700 text-white" : "bg-neutral-800 text-neutral-200"
+              }`}
+            >
+              {/* The outline tab answers whichever question was asked last. */}
+              {key === "outline" && references ? "References" : label}
+              {key === "problems" && problemCount > 0 && <span className="ml-1.5 text-red-400">{problemCount}</span>}
+            </button>
+          ))}
           <button
             onClick={() => setChatOpen((v) => !v)}
             className={`rounded px-2.5 py-1 text-[12px] hover:bg-neutral-700 ${
@@ -163,6 +174,16 @@ function App() {
               {dock === "problems" && (
                 <div className="absolute inset-0">
                   <ProblemsPanel root={projectRoot} />
+                </div>
+              )}
+              {dock === "outline" && (
+                <div className="absolute inset-0">
+                  <OutlinePanel root={projectRoot} />
+                </div>
+              )}
+              {dock === "history" && (
+                <div className="absolute inset-0">
+                  <HistoryPanel root={projectRoot} />
                 </div>
               )}
             </div>

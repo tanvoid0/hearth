@@ -1,7 +1,7 @@
 // Run with: npm test   (node's built-in runner + TS type stripping, no deps)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyEdits, resolveInProject, samePath } from "./edit.ts";
+import { applyEdits, changedLines, resolveInProject, samePath } from "./edit.ts";
 
 test("resolveInProject keeps paths inside the root", () => {
   assert.equal(resolveInProject("D:\\proj", "src/a.ts"), "D:\\proj\\src\\a.ts");
@@ -46,4 +46,22 @@ test("applyEdits is all-or-nothing on a miss", () => {
   ]);
   assert.equal(result.content, before, "a failed edit must not leave a half-applied file");
   assert.equal(result.failures.length, 1);
+});
+
+test("changedLines marks the span the agent rewrote, not the whole file", () => {
+  const before = "one\ntwo\nthree\nfour\n";
+  const after = "one\nTWO\nthree\nfour\n";
+  assert.deepEqual(changedLines(before, after), [2]);
+
+  // An insertion is new lines, at their positions in the new file.
+  assert.deepEqual(changedLines("a\nb\n", "a\nnew1\nnew2\nb\n"), [2, 3]);
+
+  // Nothing to mark when nothing moved, and nothing to mark for a deletion —
+  // there's no surviving line to decorate.
+  assert.deepEqual(changedLines(before, before), []);
+  assert.deepEqual(changedLines("a\nb\nc\n", "a\nc\n"), []);
+});
+
+test("changedLines handles a rewrite with no common lines at all", () => {
+  assert.deepEqual(changedLines("old\n", "new\n"), [1]);
 });
