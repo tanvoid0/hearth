@@ -1255,6 +1255,31 @@ sequence with nothing between them, so a tsserver that wouldn't spawn took the
 transcript down with it and the throw went somewhere nobody would see. Chat first
 now, and neither allowed to take the other down.
 
+**Verified against the real app**, not just the suite: `tauri dev` driven over
+CDP, gemma4 at 100% GPU, the page reloaded mid-turn. It landed in the middle of
+a repair round — `read_file → edit_file → get_errors → finish bounced with 4
+errors, repair 1/3` — and what came back:
+
+| | |
+|---|---|
+| banner | **Resume**, not Retry — so a `partial` was on disk |
+| the four completed steps | still there |
+| resuming | appended `read_file src/main.jsx → get_errors → summary` |
+| the prompt | **not** re-added to the transcript |
+| checkpoint | `042d892`, one file modified, `Hello Hearth` on disk |
+| GPU, 4s after the reload | **84% → 2%** |
+
+That fourth row is the one that would have been easy to get wrong and hard to
+notice: a resumed turn re-adding its own prompt reads as the user having asked
+twice. And the last row is the orphan — a generation that carried on into a dead
+channel would have held the card for the rest of the reply.
+
+**Repeating this needs one trick.** WebView2 runs one browser process per
+user-data folder and only the process that *starts* it honours
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` — so a second `tauri dev` next to a
+running one silently gets no debug port, with no error to say why. Give it its
+own `WEBVIEW2_USER_DATA_FOLDER` and the flag takes.
+
 **The thinking indicator is a flame.** It was the word "thinking…" with a live
 second count, which is the one thing on screen separating a working turn from a
 hung one — and a static word is the same picture at 3 seconds and at 300. Three
