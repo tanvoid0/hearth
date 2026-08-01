@@ -1,12 +1,14 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import { readTextFile, writeTextFile } from "./fs";
+import { runCommand } from "./terminal";
 import { bridgeConfig, BRIDGE_CONFIG_REL } from "./workspace";
 import {
   capLog,
   exitReason,
   isPhaseLine,
   isRunning,
+  missingImport,
   readyUrl,
   reduceStatus,
   pushEntry,
@@ -16,6 +18,13 @@ import {
 
 /** The script every scaffold has and almost every project names the same. */
 export const DEFAULT_SCRIPT = "dev";
+
+/** A cold registry fetch on a slow link, and the same tree-kill on expiry that
+ *  every other spawned command gets. */
+const INSTALL_TIMEOUT_SECS = 300;
+
+/** The lockfile rule lives in Rust so there's one of it, not two. */
+const packageManager = (root: string): Promise<string> => invoke("package_manager", { root });
 
 interface RunnerState {
   /** Derived from `status`; kept as a field so components that only care
@@ -42,6 +51,16 @@ interface RunnerState {
   detachConsole: () => void;
   pushConsole: (kind: string, text: string) => void;
   markConsole: () => void;
+
+  /** Packages the output said it couldn't resolve, in the order they first
+   *  failed. Build plan §4.2's install-on-demand: a local model importing
+   *  something the project doesn't have is the failure it produces most, and
+   *  the runner is the only thing that sees it happen. */
+  missing: string[];
+  /** Which one is being installed, or null. One at a time — two package
+   *  managers writing the same lockfile is how a project gets a broken one. */
+  installing: string | null;
+  install: (root: string, name: string) => Promise<void>;
 
   start: (root: string, script?: string) => Promise<void>;
   stop: () => Promise<void>;
@@ -77,6 +96,8 @@ export const useRunner = create<RunnerState>((set, get) => ({
   consoleLog: [],
   consoleAttached: false,
   consoleMark: 0,
+  missing: [],
+  installing: null,
 
   // A fresh document means the old messages describe a page that no longer
   // exists — including after a full reload triggered by an agent edit.
@@ -84,6 +105,34 @@ export const useRunner = create<RunnerState>((set, get) => ({
   detachConsole: () => set({ consoleAttached: false }),
   pushConsole: (kind, text) => set((s) => ({ consoleLog: pushEntry(s.consoleLog, `${kind}: ${text}`) })),
   markConsole: () => set((s) => ({ consoleMark: s.consoleLog.length })),
+
+  // `add` rather than `install`: it's the only spelling pnpm, yarn and bun all
+  // share, and npm aliases it. Goes through `run_command`, so the allowlist and
+  // the metacharacter check that guard the agent's commands guard this one too.
+  install: async (root, name) => {
+    if (get().installing) return;
+    set({ installing: name });
+    const command = `${await packageManager(root)} add ${name}`;
+    set((s) => ({ log: capLog(s.log, `$ ${command}`) }));
+    try {
+      const { exit_code, output, timed_out } = await runCommand(root, command, INSTALL_TIMEOUT_SECS);
+      const failed = timed_out || exit_code !== 0;
+      // The tail, not the whole thing: npm prints a tree, and the reason it
+      // refused is the last thing in it.
+      const tail = output.trim().split("\n").slice(-5).filter(Boolean);
+      set((s) => ({
+        log: tail.reduce(capLog, s.log),
+        missing: failed ? s.missing : s.missing.filter((m) => m !== name),
+      }));
+      // Vite re-optimises when something asks for the module again, and nothing
+      // will until the page is reloaded.
+      if (!failed) get().reload();
+    } catch (err) {
+      set((s) => ({ log: capLog(s.log, String(err)) }));
+    } finally {
+      set({ installing: null });
+    }
+  },
 
   start: async (root, script = get().script) => {
     // Claimed before the first await, or two quick clicks both get past the
@@ -98,6 +147,7 @@ export const useRunner = create<RunnerState>((set, get) => ({
       consoleLog: [],
       consoleAttached: false,
       consoleMark: 0,
+      missing: [],
     });
 
     const scripts = await projectScripts(root);
@@ -120,12 +170,16 @@ export const useRunner = create<RunnerState>((set, get) => ({
     onEvent.onmessage = (line) => {
       set((s) => {
         const status = reduceStatus(s.status, line, port);
+        const pkg = missingImport(line);
         return {
           status,
           running: isRunning(status),
           // Phase markers drive the machine and say nothing worth reading.
           log: isPhaseLine(line) ? s.log : capLog(s.log, exitReason(line) ?? line),
           url: s.url ?? (port ? readyUrl(line, port) : null),
+          // Vite repeats the failure on every request for the module, so this
+          // has to be a set rather than a list of events.
+          missing: pkg && !s.missing.includes(pkg) ? [...s.missing, pkg] : s.missing,
         };
       });
     };

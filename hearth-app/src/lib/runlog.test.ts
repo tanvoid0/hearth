@@ -10,6 +10,7 @@ import {
   exitReason,
   formatEntry,
   isPhaseLine,
+  missingImport,
   pushEntry,
   readyUrl,
   reduceStatus,
@@ -39,6 +40,52 @@ test("readyUrl won't match a different port that shares a prefix", () => {
 test("exitReason splits control lines from log output", () => {
   assert.equal(exitReason("[hearth] npm install failed (exit 1)"), "npm install failed (exit 1)");
   assert.equal(exitReason("added 42 packages in 3s"), null);
+});
+
+// The lines below are copied verbatim from a vite 7.3.6 run against a project
+// with an uninstalled import — the wording is not what it reads like it should
+// be, and both the capital F and the startup form were wrong when guessed.
+test("missingImport names the package in vite's three complaints", () => {
+  assert.equal(
+    missingImport(`10:04:36 [vite] Internal server error: Failed to resolve import "lodash" from "src/main.js". Does the file exist?`),
+    "lodash",
+  );
+  // Build time is rollup's wording, and it lowercases the verb.
+  assert.equal(missingImport(`[vite]: Rollup failed to resolve import "lodash" from "C:/p/src/main.js".`), "lodash");
+  // The startup dependency scan, which is what fires *first* and never uses
+  // the phrase the other two share.
+  assert.equal(missingImport(`  lodash (imported by C:/p/src/main.js)`), "lodash");
+});
+
+test("missingImport names the package node complains about", () => {
+  assert.equal(missingImport(`Error: Cannot find package 'express' imported from D:\\p\\server.js`), "express");
+  assert.equal(missingImport(`Error: Cannot find module 'dotenv'`), "dotenv");
+});
+
+test("missingImport reduces a subpath to the package that installs it", () => {
+  assert.equal(missingImport(`Failed to resolve import "lodash/fp" from "src/App.jsx"`), "lodash");
+  assert.equal(missingImport(`Failed to resolve import "@tanstack/react-query" from "src/App.jsx"`), "@tanstack/react-query");
+  assert.equal(
+    missingImport(`  @tanstack/react-query/devtools (imported by C:/p/src/main.js)`),
+    "@tanstack/react-query",
+  );
+});
+
+test("missingImport ignores everything that isn't installable", () => {
+  // A relative path that won't resolve is a file the model hasn't written yet.
+  // Installing a package named after it would be worse than doing nothing.
+  assert.equal(missingImport(`Failed to resolve import "./Header" from "src/App.jsx"`), null);
+  assert.equal(missingImport(`Failed to resolve import "../lib/util" from "src/App.jsx"`), null);
+  assert.equal(missingImport(`Cannot find module 'C:\\proj\\src\\app.js'`), null);
+  assert.equal(missingImport(`Failed to resolve import "node:fs" from "src/App.jsx"`), null);
+  assert.equal(missingImport(`Failed to resolve import "virtual:hearth" from "x"`), null);
+  // A name that would read as a flag never reaches the command line.
+  assert.equal(missingImport(`Failed to resolve import "--registry=http://evil" from "x"`), null);
+  assert.equal(missingImport("added 42 packages in 3s"), null);
+  // The scan's own heading and the prose around it sit in the same block as the
+  // package lines and must not be read as package names.
+  assert.equal(missingImport("  The following dependencies are imported but could not be resolved:"), null);
+  assert.equal(missingImport("  Are they installed?"), null);
 });
 
 test("capLog keeps the newest lines and drops the oldest", () => {

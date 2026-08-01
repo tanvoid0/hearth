@@ -32,6 +32,52 @@ export function exitReason(line: string): string | null {
 }
 
 /**
+ * How a missing package is worded, taken from real vite 7 output rather than
+ * from memory — the wording is not what you'd guess, and two of these three
+ * were wrong on the first attempt.
+ *
+ * The last one is the whole reason there are three: the dev server's *first*
+ * complaint is a startup block, one package per line, which never contains the
+ * phrase "failed to resolve import" at all. The single-line form only appears
+ * later, when something actually requests the module.
+ */
+const RESOLVE_FAILURES = [
+  // Vite's import analysis on a request. Rollup words it "Rollup failed to
+  // resolve import …" at build time, hence case-insensitive.
+  /failed to resolve import ["']([^"']+)["']/i,
+  // Node, when the script the runner started isn't vite.
+  /Cannot find (?:module|package) ["']([^"']+)["']/,
+  // Vite's dependency scan at startup, under "The following dependencies are
+  // imported but could not be resolved:".
+  /^ {2}(\S+) \(imported by /,
+];
+
+/** npm's own rule for a package name. Applied because the name goes on to be a
+ *  command argument, and this line came from a process's stdout. */
+const PACKAGE_NAME = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+
+/**
+ * The package named by a resolution failure, or null for any other line —
+ * build plan §4.2's install-on-demand, and §9's mitigation for the thing local
+ * models do most: import something the project doesn't have.
+ *
+ * Only bare specifiers count. A relative path that doesn't resolve is a file
+ * the model hasn't written yet, and installing a package named after it would
+ * be worse than doing nothing; `node:`/`virtual:` are schemes rather than
+ * packages, and a Windows path is neither. All three fall out of validating the
+ * name instead of being special-cased.
+ */
+export function missingImport(line: string): string | null {
+  const specifier = RESOLVE_FAILURES.map((pattern) => pattern.exec(line)?.[1]).find(Boolean);
+  if (!specifier) return null;
+  // A subpath installs as its package: `lodash/fp` → `lodash`, and
+  // `@scope/pkg/sub` → `@scope/pkg`.
+  const parts = specifier.split("/");
+  const name = specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+  return PACKAGE_NAME.test(name) ? name : null;
+}
+
+/**
  * Build plan §3's run states. The distinction that earns the machine is
  * `installing` vs `starting`: a cold `npm install` runs for minutes with no
  * output a user can read as progress, and "starting…" over the top of it is

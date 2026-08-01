@@ -1039,6 +1039,52 @@ checking, with nothing between the file and the page. Two, not ten — a starter
 nobody picks is a starter nobody maintains, and the agent's first job on any of
 them is to replace most of it anyway.
 
+### Install-on-demand — the one plan item nobody had decided against
+
+Build plan §4.2 asks the runner to notice a package that isn't installed and
+offer to install it; §9 lists it as *the* mitigation for hallucinated imports,
+which is the failure local models produce most. It was the only item in the
+plan that had neither been built nor argued out of, so it's built: an amber
+`+ install lodash` chip in the preview header, one click, page reloads.
+
+- **It goes through `run_command`**, not a new Rust command — so the allowlist,
+  the shell-metacharacter refusal, the timeout and the tree-kill that guard the
+  agent's commands guard this too. The one new command is `package_manager`,
+  which is `detect_pm` behind a `#[tauri::command]`: the lockfile rule stays in
+  one place rather than being re-implemented in TypeScript.
+- **`add`, not `install`.** It's the only spelling pnpm, yarn and bun share, and
+  npm aliases it. One verb instead of a branch per manager.
+- **The name is validated against npm's own rule at the point it's parsed**,
+  which is what makes it safe to put on a command line — the string arrives from
+  a subprocess's stdout, and `--registry=http://evil` reads exactly like a
+  package name until something checks.
+- **Bare specifiers only.** A relative import that won't resolve is a file the
+  model hasn't written yet; installing a package named after it would be worse
+  than doing nothing. `node:`/`virtual:` schemes and Windows paths fall out of
+  the same name check rather than needing cases of their own.
+
+**Measured against vite 7.3.6 rather than remembered, and two of three guesses
+were wrong.** The strings in the tests are copied from a real run:
+
+| when | what it prints |
+|---|---|
+| dev server startup | `  lodash (imported by C:/…/src/main.js)` under "The following dependencies are imported but could not be resolved" |
+| dev server, on request | `Failed to resolve import "lodash" from "src/main.js". Does the file exist?` |
+| `vite build` | `[vite]: Rollup failed to resolve import "lodash" from "…"` |
+
+The startup form is the one that fires *first* and it never contains the phrase
+the other two share — a single-line regex for "Failed to resolve import" would
+have sat silent through exactly the case this exists for. The build form
+lowercases the verb, so the match is case-insensitive. Verified end to end in a
+scratch project: broken import → chip → `npm add lodash` → `✓ built in 270ms`.
+
+Node's `Cannot find module 'x'` is in there too, for the scripts in the dropdown
+that aren't vite.
+
+**Open in the system browser** landed in the same header — the iframe has no
+devtools, the system browser does, and `tauri-plugin-opener` was already a
+dependency with the permission already granted.
+
 ---
 
 ## Remaining work
@@ -1056,6 +1102,9 @@ decisions rather than backlog.
       keyed by id so the agent's separate PTY is a second key rather than a
       rewrite.
 - [x] **P3 · Runner** — done (above).
+- [x] **P3 · Install-on-demand** — the runner detects an unresolved package and
+      offers a one-click install (above). §9's mitigation for the failure local
+      models produce most.
 - [x] **P4 · Browser** — done (above), except that the injected bridge is
       vite-only. A Next or webpack project runs and previews fine; it just has
       no console capture, which `consoleTail` reports rather than passing off as
@@ -1222,15 +1271,15 @@ cd hearth-app && npm run tauri dev
 ```
 
 ```bash
-# Unit tests (97): path safety, search/replace, session packing, context
-# sizing, run-state machine, dev-log parsing, pull progress, fenced-code
+# Unit tests (101): path safety, search/replace, session packing, context
+# sizing, run-state machine, dev-log and missing-package parsing, pull progress, fenced-code
 # splitting, checkpoint name-status, hunk parsing, repo-map extraction, .env
 # redaction, diagnostic folding — plus one that drives a real tsserver end to end
 cd hearth-app && npm test
 ```
 
 ```bash
-# Rust tests (18): NDJSON, PTY and Content-Length framing, package-manager
+# Rust tests (19): NDJSON, PTY and Content-Length framing, package-manager
 # detection, project search, the command allowlist, a real shell in a real PTY,
 # a real tsserver reporting a real type error, and the whole checkpoint sequence
 # against a real git repo

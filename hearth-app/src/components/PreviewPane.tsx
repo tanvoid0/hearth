@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useHearthStore } from "../lib/store";
 import { projectScripts, useRunner } from "../lib/runner";
 import { formatEntry, STATUS_TEXT } from "../lib/runlog";
@@ -14,7 +15,8 @@ const VIEWPORTS: Array<{ label: string; width: number | null }> = [
 
 export function PreviewPane() {
   const projectRoot = useHearthStore((s) => s.projectRoot);
-  const { running, status, script, url, log, nonce, consoleLog, start, stop, reload } = useRunner();
+  const { running, status, script, url, log, nonce, consoleLog, missing, installing, install, start, stop, reload } =
+    useRunner();
   // The log is the whole UI while installing, so it opens itself and only
   // collapses once there's a page to look at instead.
   const [showLog, setShowLog] = useState(false);
@@ -140,6 +142,15 @@ export function PreviewPane() {
             >
               ↻
             </button>
+            {/* The iframe has no devtools of its own; the system browser does,
+                and it's the same origin serving the same page. */}
+            <button
+              onClick={() => void openUrl(url.replace(/\/$/, "") + path)}
+              title="Open this page in your browser"
+              className="shrink-0 rounded px-1.5 py-0.5 text-[12px] text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+            >
+              ↗
+            </button>
             {/* The origin is the runner's, and it changes every run — so only
                 the path is editable. There's no way to read back where the page
                 navigated itself to: the iframe is a different origin. */}
@@ -187,6 +198,22 @@ export function PreviewPane() {
             ))}
           </select>
         )}
+
+        {/* Build plan §4.2: a model importing a package the project doesn't
+            have is a hard failure — a blank page and a log line — that one
+            click converts into a working app. Named, so it can't quietly
+            install something that isn't the package you read about. */}
+        {missing.map((name) => (
+          <button
+            key={name}
+            disabled={installing !== null}
+            onClick={() => projectRoot && void install(projectRoot, name)}
+            title={`${name} is imported but not installed. Adds it with the project's own package manager.`}
+            className="shrink-0 rounded bg-amber-950 px-1.5 py-0.5 text-[11px] text-amber-300 hover:bg-amber-900 disabled:opacity-50"
+          >
+            {installing === name ? `installing ${name}…` : `+ install ${name}`}
+          </button>
+        ))}
 
         {/* A runtime error leaves a blank page and an empty dev-server log, so
             with the drawer collapsed there'd be nothing at all to see. */}

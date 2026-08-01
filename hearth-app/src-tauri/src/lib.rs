@@ -252,6 +252,13 @@ fn detect_pm(root: &str) -> &'static str {
     .unwrap_or("npm")
 }
 
+/// The same answer, for the frontend's install-on-demand chip. One lockfile
+/// rule rather than a second one written in TypeScript.
+#[tauri::command]
+fn package_manager(root: String) -> &'static str {
+    detect_pm(&root)
+}
+
 fn pm(root: &str, exe: &str, args: &[&str]) -> Command {
     // These are .cmd shims on Windows, which CreateProcess won't launch
     // directly. Going through cmd also gives `taskkill /T` a parent to walk
@@ -1428,6 +1435,17 @@ mod tests {
     }
 
     #[test]
+    fn install_on_demand_is_allowed_for_every_package_manager() {
+        // The exact string the runner's install chip builds. `add` is the only
+        // spelling all four share, and a scoped name has to survive the
+        // metacharacter check.
+        for manager in ["npm", "pnpm", "yarn", "bun"] {
+            assert!(super::check_command(&format!("{manager} add lodash")).is_ok());
+            assert!(super::check_command(&format!("{manager} add @tanstack/react-query")).is_ok());
+        }
+    }
+
+    #[test]
     fn command_check_refuses_chaining_past_an_allowed_program() {
         // The whole reason the allowlist can't just read the first word: every
         // one of these starts with something allowed.
@@ -1534,6 +1552,7 @@ pub fn run() {
             ollama_pull,
             run_dev,
             stop_dev,
+            package_manager,
             search_files,
             pty_open,
             pty_write,
