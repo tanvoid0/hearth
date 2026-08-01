@@ -1085,6 +1085,27 @@ that aren't vite.
 devtools, the system browser does, and `tauri-plugin-opener` was already a
 dependency with the permission already granted.
 
+### The search panel — §4.7's, not a second search
+
+`search_files` has existed since P11 and only the agent could reach it. The
+Search tab in the dock is that same command with a text field in front of it:
+one search implementation, not one for the model and a different one for the
+user. Ctrl+Shift+F, or the palette.
+
+- **On Enter, not as you type.** The search walks every file on every call —
+  deliberately, since there's no index — and a keystroke-triggered walk of a
+  large repo is how a panel becomes the reason an app feels slow.
+- **Jumping goes through `resolveInProject`**, the agent's own resolver, rather
+  than `root + "/" + rel`. Hits come back with forward slashes and tabs are
+  keyed by the exact path string, so concatenating would open a second tab for a
+  file the tree already had open under backslashes. `jumpTo` then does the rest,
+  since opening a tab unmounts the editor that asked.
+
+**Replace-across-project is deliberately absent** even though §4.7 lists it. A
+bulk rewrite the user starts has no undo boundary — checkpoints are per agent
+turn — and the agent's own edit path already does project-wide changes with one
+behind it. Build it when there's an undo for it, not before.
+
 ---
 
 ## Remaining work

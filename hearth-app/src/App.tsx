@@ -9,6 +9,7 @@ import { PreviewPane } from "./components/PreviewPane";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { Home } from "./components/Home";
 import { ProblemsPanel } from "./components/ProblemsPanel";
+import { SearchPanel } from "./components/SearchPanel";
 import { OutlinePanel } from "./components/OutlinePanel";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { ProjectPanel } from "./components/ProjectPanel";
@@ -18,10 +19,11 @@ import { useLsp } from "./lib/lsp";
 import { committedVersion } from "./lib/git";
 
 /** The bottom dock holds one thing at a time (build plan §3). */
-type Dock = "terminal" | "problems" | "outline" | "history" | "project" | null;
+type Dock = "terminal" | "problems" | "search" | "outline" | "history" | "project" | null;
 
 const DOCK_TABS: Array<{ key: Exclude<Dock, null>; label: string }> = [
   { key: "problems", label: "Problems" },
+  { key: "search", label: "Search" },
   { key: "outline", label: "Outline" },
   { key: "history", label: "History" },
   { key: "project", label: "Project" },
@@ -93,7 +95,14 @@ function App() {
   // suppress the webview's own save-page handler either way.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "s") return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      // Ctrl+Shift+F is project-wide search; Monaco keeps Ctrl+F for the file.
+      if (e.shiftKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        setDock("search");
+        return;
+      }
+      if (e.key.toLowerCase() !== "s") return;
       e.preventDefault();
       const { activePath, saveTab } = useHearthStore.getState();
       if (activePath) void saveTab(activePath);
@@ -198,6 +207,11 @@ function App() {
               {dock === "problems" && (
                 <div className="absolute inset-0">
                   <ProblemsPanel root={projectRoot} />
+                </div>
+              )}
+              {dock === "search" && (
+                <div className="absolute inset-0">
+                  <SearchPanel root={projectRoot} />
                 </div>
               )}
               {dock === "outline" && (
