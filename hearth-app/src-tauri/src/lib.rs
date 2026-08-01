@@ -700,6 +700,166 @@ fn git_blocking(root: &str, args: &[String]) -> Result<GitOutput, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Language server
+// ---------------------------------------------------------------------------
+
+/// The running tsserver, if any. One at a time, like the dev server: one
+/// project is open at a time, and a second instance would only duplicate every
+/// diagnostic.
+struct Tsserver {
+    stdin: std::process::ChildStdin,
+    pid: u32,
+    child: std::process::Child,
+}
+
+static TSSERVER: Mutex<Option<Tsserver>> = Mutex::new(None);
+
+const TSSERVER_REL: &str = "node_modules/typescript/lib/tsserver.js";
+
+/// Find a `tsserver.js` to run.
+///
+/// Build plan §2 names `typescript-language-server`; this talks to `tsserver`
+/// directly, which is the thing that wrapper wraps and the same protocol VS
+/// Code's own TypeScript support speaks. It needs no new dependency —
+/// `typescript` is already installed here — and Monaco doesn't speak LSP
+/// natively either, so the wire format would have to be translated either way.
+///
+/// The project's own TypeScript wins when it has one: that's the version its
+/// code was written against, and the one its `npm run build` will use.
+///
+/// ponytail: the fallback walks up from the working directory, which finds
+/// Hearth's own copy under `tauri dev` and nothing at all in a packaged app.
+/// Ship `tsserver.js` as a Tauri resource when this gets bundled — `ts_start`
+/// already reports its absence as a plain "not available" rather than pretending
+/// the project is clean.
+fn tsserver_script(root: &str) -> Option<std::path::PathBuf> {
+    let own = Path::new(root).join(TSSERVER_REL);
+    if own.is_file() {
+        return Some(own);
+    }
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(TSSERVER_REL);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Start tsserver for a project. Messages arrive on the channel as raw JSON
+/// bodies — the frontend owns the protocol, this owns the framing, the same
+/// split as `ollama_stream` and `run_dev`.
+#[tauri::command]
+fn ts_start(root: String, on_message: Channel<String>) -> Result<(), String> {
+    ts_stop()?;
+    let script = tsserver_script(&root).ok_or(
+        "no TypeScript found — language features need node_modules/typescript in the project or in Hearth's own install",
+    )?;
+
+    let mut cmd = Command::new("node");
+    cmd.arg(&script)
+        // Left on, this downloads @types packages from npm in the background —
+        // network traffic an offline-first app shouldn't generate, for types
+        // the project didn't ask for.
+        .arg("--disableAutomaticTypingAcquisition")
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // tsserver logs nothing here unless asked; a full pipe with no reader
+        // would block it.
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start tsserver with node ({e}) — is node on PATH?"))?;
+    let stdin = child.stdin.take().ok_or("tsserver stdin")?;
+    let mut stdout = child.stdout.take().ok_or("tsserver stdout")?;
+    let pid = child.id();
+
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break, // tsserver exited, or the pipe closed
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    while let Some(msg) = take_message(&mut buf) {
+                        if on_message.send(msg).is_err() {
+                            return; // window went away
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    *TSSERVER.lock().unwrap() = Some(Tsserver { stdin, pid, child });
+    Ok(())
+}
+
+/// Send one request. tsserver reads newline-delimited JSON on stdin even though
+/// it writes `Content-Length`-framed JSON on stdout.
+#[tauri::command]
+fn ts_send(body: String) -> Result<(), String> {
+    let mut held = TSSERVER.lock().unwrap();
+    let ts = held.as_mut().ok_or("language server not running")?;
+    ts.stdin.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    ts.stdin.write_all(b"\n").map_err(|e| e.to_string())?;
+    ts.stdin.flush().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn ts_stop() -> Result<(), String> {
+    let Some(mut ts) = TSSERVER.lock().unwrap().take() else {
+        return Ok(());
+    };
+    // Dropping stdin is the polite exit — tsserver shuts down on EOF. The kill
+    // is for the case where it's wedged mid-check and never reads again.
+    drop(ts.stdin);
+    let _ = kill_tree(ts.pid);
+    let _ = ts.child.kill();
+    let _ = ts.child.wait();
+    Ok(())
+}
+
+/// Drain one `Content-Length`-framed message body, leaving any partial tail.
+///
+/// Unlike the NDJSON path there's no newline to resync on, and unlike the PTY
+/// path the length is declared up front — so the only real hazard is a header
+/// that never completes. A header with no `Content-Length` is dropped rather
+/// than waited on: it can never become valid, and waiting would stall every
+/// message behind it forever, the same failure `take_utf8` avoids for bytes.
+fn take_message(buf: &mut Vec<u8>) -> Option<String> {
+    loop {
+        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let len = String::from_utf8_lossy(&buf[..sep])
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length:")?.trim().parse::<usize>().ok());
+        let Some(len) = len else {
+            buf.drain(..sep + 4);
+            continue;
+        };
+        if buf.len() < sep + 4 + len {
+            return None;
+        }
+        // The header counts bytes, not characters, so the split has to happen
+        // on the byte buffer — a body with any non-ASCII in it lands short
+        // otherwise.
+        let body: Vec<u8> = buf.drain(..sep + 4 + len).skip(sep + 4).collect();
+        return Some(String::from_utf8_lossy(&body).into_owned());
+    }
+}
+
 /// Drain whole newline-terminated lines from `buf`, leaving any partial tail.
 fn take_lines(buf: &mut Vec<u8>) -> Vec<String> {
     let mut lines = Vec::new();
@@ -715,8 +875,142 @@ fn take_lines(buf: &mut Vec<u8>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{take_lines, take_utf8};
+    use super::{take_lines, take_message, take_utf8};
     use std::io::Write;
+
+    #[test]
+    fn tsserver_framing_survives_arbitrary_chunk_boundaries() {
+        // Two messages, the second holding a multi-byte character — so the
+        // declared length (bytes) and the character count disagree, which is
+        // exactly what a naive char-based split gets wrong.
+        let bodies = ["{\"seq\":1}", "{\"text\":\"café ✓\"}"];
+        let mut wire = Vec::new();
+        for body in bodies {
+            wire.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            wire.extend_from_slice(body.as_bytes());
+        }
+
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        for byte in &wire {
+            buf.push(*byte);
+            while let Some(msg) = take_message(&mut buf) {
+                got.push(msg);
+            }
+        }
+        assert_eq!(got, bodies);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_header_without_a_length_does_not_stall_the_stream() {
+        // It can never become valid, so waiting for it would block every
+        // message behind it forever — the same trap `take_utf8` avoids.
+        let mut buf = Vec::from(&b"Nonsense: 1\r\n\r\nContent-Length: 5\r\n\r\nhello"[..]);
+        assert_eq!(take_message(&mut buf).as_deref(), Some("hello"));
+    }
+
+    /// End-to-end through the real thing: spawn tsserver the way `ts_start`
+    /// does, open a JSX file with a mistake in it, and read a diagnostic back.
+    ///
+    /// This is the half where "it compiles" is furthest from "it works" — the
+    /// protocol is newline-delimited going in and `Content-Length`-framed
+    /// coming out, and nothing in the type system says so.
+    #[test]
+    fn tsserver_reports_a_type_error_in_a_jsx_file() {
+        use std::fs;
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let root = std::env::temp_dir().join(format!("hearth-ts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("mkdir");
+        // No @types/react and no node_modules here on purpose: `checkJs` alone
+        // is what turns an undefined name into a compile error, and that's the
+        // finding this phase rests on.
+        fs::write(
+            root.join("jsconfig.json"),
+            r#"{"compilerOptions":{"checkJs":true,"jsx":"react-jsx"},"include":["src"]}"#,
+        )
+        .unwrap();
+        let source = "export function total(items) {\n  return items + missingThing;\n}\n";
+        let file = root.join("src/math.js");
+        fs::write(&file, source).unwrap();
+
+        let root_s = root.to_string_lossy().to_string();
+        let Some(script) = super::tsserver_script(&root_s) else {
+            // A packaged build with no bundled tsserver — the app reports this
+            // as "not available" rather than as a clean project, and so does
+            // this test rather than failing on someone else's machine.
+            eprintln!("no tsserver.js found; skipping");
+            return;
+        };
+
+        let mut child = Command::new("node")
+            .arg(&script)
+            .arg("--disableAutomaticTypingAcquisition")
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn tsserver");
+
+        let mut stdin = child.stdin.take().unwrap();
+        let file_s = file.to_string_lossy().replace('\\', "/");
+        for req in [
+            format!(
+                r#"{{"seq":1,"type":"request","command":"open","arguments":{{"file":"{file_s}","projectRootPath":"{}"}}}}"#,
+                root_s.replace('\\', "/")
+            ),
+            format!(r#"{{"seq":2,"type":"request","command":"geterr","arguments":{{"files":["{file_s}"],"delay":0}}}}"#),
+        ] {
+            stdin.write_all(req.as_bytes()).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+        stdin.flush().unwrap();
+
+        // Read on a thread so a server that never answers fails the test rather
+        // than hanging it — the lesson from the PSReadLine hang next door.
+        let mut stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            let mut buf: Vec<u8> = Vec::new();
+            let mut seen = String::new();
+            while let Ok(n) = stdout.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                while let Some(msg) = take_message(&mut buf) {
+                    seen.push_str(&msg);
+                    if msg.contains("semanticDiag") {
+                        let _ = tx.send(msg);
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(seen);
+        });
+
+        // Cold start loads the whole compiler; generous, and it returns as soon
+        // as the event arrives.
+        let got = rx.recv_timeout(Duration::from_secs(60)).unwrap_or_default();
+        let elapsed = started.elapsed();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            got.contains("Cannot find name 'missingThing'"),
+            "no type error came back after {:?}; got {:?}",
+            elapsed,
+            got
+        );
+    }
 
     /// The checkpoint sequence `git.ts` drives, against a real repo: init,
     /// baseline, a turn's commit, the name-status a card is built from, both
@@ -1008,7 +1302,10 @@ pub fn run() {
             pty_resize,
             pty_close,
             run_command,
-            git
+            git,
+            ts_start,
+            ts_send,
+            ts_stop
         ])
         // Closing the window doesn't reap child process trees, and a stray vite
         // holding the port — or a build still running under a dead terminal —
@@ -1017,6 +1314,7 @@ pub fn run() {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 let _ = stop_dev();
                 close_all_ptys();
+                let _ = ts_stop();
             }
         })
         .run(tauri::generate_context!())

@@ -8,8 +8,13 @@ import { ChatPanel } from "./components/ChatPanel";
 import { PreviewPane } from "./components/PreviewPane";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { Home } from "./components/Home";
+import { ProblemsPanel } from "./components/ProblemsPanel";
 import { CommandPalette, type PaletteCommand } from "./components/CommandPalette";
 import { useRunner } from "./lib/runner";
+import { useLsp } from "./lib/lsp";
+
+/** The bottom dock holds one thing at a time (build plan §3). */
+type Dock = "terminal" | "problems" | null;
 
 function App() {
   const projectRoot = useHearthStore((s) => s.projectRoot);
@@ -17,13 +22,21 @@ function App() {
   const closeProject = useHearthStore((s) => s.closeProject);
   const [chatOpen, setChatOpen] = useState(true);
   const [previewOpen, setPreviewOpen] = useState(false);
-  const [terminalOpen, setTerminalOpen] = useState(false);
-  // Once opened it stays mounted and is hidden instead: unmounting would kill
-  // the shell, so toggling the panel would silently discard your cwd, your
-  // history, and anything still running in it.
+  const [dock, setDock] = useState<Dock>(null);
+  // Once opened the terminal stays mounted and is hidden instead: unmounting
+  // would kill the shell, so switching away would silently discard your cwd,
+  // your history, and anything still running in it.
   const [terminalUsed, setTerminalUsed] = useState(false);
   // Only to mark the collapsed Preview button when a server is up behind it.
   const running = useRunner((s) => s.running);
+  // A type error with the dock collapsed is otherwise invisible until you open
+  // the file — the same argument as the preview's console badge.
+  const problemCount = useLsp((s) => s.problems.length);
+
+  function toggleDock(which: Exclude<Dock, null>) {
+    if (which === "terminal") setTerminalUsed(true);
+    setDock((current) => (current === which ? null : which));
+  }
 
   async function handleOpenFolder() {
     const folder = await pickFolder();
@@ -60,7 +73,8 @@ function App() {
         if (activePath) void saveTab(activePath);
       } },
       { label: "Open folder…", run: () => void handleOpenFolder() },
-      { label: "Toggle terminal", run: () => { setTerminalUsed(true); setTerminalOpen((v) => !v); } },
+      { label: "Toggle terminal", run: () => toggleDock("terminal") },
+      { label: "Toggle problems", run: () => toggleDock("problems") },
       { label: "Toggle preview", run: () => setPreviewOpen((v) => !v) },
       { label: "Toggle agent panel", run: () => setChatOpen((v) => !v) },
       { label: "Run dev server", run: () => projectRoot && void useRunner.getState().start(projectRoot) },
@@ -98,12 +112,18 @@ function App() {
             Preview{running && !previewOpen ? " ●" : ""}
           </button>
           <button
-            onClick={() => {
-              setTerminalUsed(true);
-              setTerminalOpen((v) => !v);
-            }}
+            onClick={() => toggleDock("problems")}
             className={`rounded px-2.5 py-1 text-[12px] hover:bg-neutral-700 ${
-              terminalOpen ? "bg-neutral-700 text-white" : "bg-neutral-800 text-neutral-200"
+              dock === "problems" ? "bg-neutral-700 text-white" : "bg-neutral-800 text-neutral-200"
+            }`}
+          >
+            Problems
+            {problemCount > 0 && <span className="ml-1.5 text-red-400">{problemCount}</span>}
+          </button>
+          <button
+            onClick={() => toggleDock("terminal")}
+            className={`rounded px-2.5 py-1 text-[12px] hover:bg-neutral-700 ${
+              dock === "terminal" ? "bg-neutral-700 text-white" : "bg-neutral-800 text-neutral-200"
             }`}
           >
             Terminal
@@ -133,9 +153,18 @@ function App() {
             <EditorPane />
           </div>
           {previewOpen && <PreviewPane />}
-          {terminalUsed && (
-            <div className={`h-64 shrink-0 border-t border-neutral-800 ${terminalOpen ? "" : "hidden"}`}>
-              <TerminalPanel root={projectRoot} visible={terminalOpen} />
+          {(terminalUsed || dock !== null) && (
+            <div className={`relative h-64 shrink-0 border-t border-neutral-800 ${dock ? "" : "hidden"}`}>
+              {terminalUsed && (
+                <div className={`absolute inset-0 ${dock === "terminal" ? "" : "hidden"}`}>
+                  <TerminalPanel root={projectRoot} visible={dock === "terminal"} />
+                </div>
+              )}
+              {dock === "problems" && (
+                <div className="absolute inset-0">
+                  <ProblemsPanel root={projectRoot} />
+                </div>
+              )}
             </div>
           )}
         </main>

@@ -115,8 +115,10 @@ const CONSOLE_BRIDGE = `    <!-- Hearth: forwards runtime errors to the preview 
  * breaks the project before the user sees anything. Editing an existing,
  * known-good scaffold is the job it actually did well in P0.
  *
- * JSX rather than TSX on purpose: no type errors to chase until P9 puts an
- * LSP behind the agent.
+ * JSX rather than TSX on purpose: annotations a local model has to get right
+ * are a tax on every edit. The jsconfig below buys most of what TSX would —
+ * undefined names, wrong argument counts, misspelled DOM props — without asking
+ * it to write a single type.
  */
 export function template(name: string): Record<string, string> {
   return {
@@ -128,7 +130,36 @@ export function template(name: string): Record<string, string> {
         type: "module",
         scripts: { dev: "vite", build: "vite build", preview: "vite preview" },
         dependencies: { react: "^19.1.0", "react-dom": "^19.1.0" },
-        devDependencies: { "@vitejs/plugin-react": "^4.6.0", vite: "^7.0.4" },
+        devDependencies: {
+          "@vitejs/plugin-react": "^4.6.0",
+          vite: "^7.0.4",
+          // Not optional decoration: without React's types every JSX file
+          // reports "Cannot find module 'react'" and nothing else can be
+          // checked past it — measured, not assumed.
+          "@types/react": "^19.1.0",
+          "@types/react-dom": "^19.1.0",
+        },
+      },
+      null,
+      2,
+    ) + "\n",
+
+    // What turns the language server on for a plain-JS project. Without a
+    // tsconfig or jsconfig, tsserver files everything under an "inferred
+    // project" and reports no diagnostics at all — which is indistinguishable
+    // from a clean project, for the user and for the agent.
+    "jsconfig.json": JSON.stringify(
+      {
+        compilerOptions: {
+          // The whole point: type-check .js/.jsx without writing any types.
+          checkJs: true,
+          jsx: "react-jsx",
+          module: "esnext",
+          moduleResolution: "bundler",
+          target: "esnext",
+          lib: ["esnext", "dom", "dom.iterable"],
+        },
+        include: ["src"],
       },
       null,
       2,

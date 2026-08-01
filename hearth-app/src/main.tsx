@@ -8,6 +8,7 @@ import CssWorker from "monaco-editor/language/css/css.worker.js?worker";
 import HtmlWorker from "monaco-editor/language/html/html.worker.js?worker";
 import TsWorker from "monaco-editor/language/typescript/ts.worker.js?worker";
 import App from "./App";
+import { registerLanguageFeatures } from "./lib/monaco-ts";
 import "./index.css";
 
 // Self-host Monaco instead of the @monaco-editor/react default of fetching
@@ -34,6 +35,12 @@ self.MonacoEnvironment = {
   },
 };
 loader.config({ monaco });
+
+// Hover, go-to-definition, symbols and diagnostics come from tsserver, which
+// can see the filesystem — Monaco's own worker can't, so it reports every
+// import as unresolvable. Registered here rather than lazily so the handover
+// happens before the first editor mounts.
+registerLanguageFeatures();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

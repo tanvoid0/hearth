@@ -656,6 +656,132 @@ checkpoint, given the edits have already landed by the time the card exists.
 Per-file revert is the more likely next step ("it broke App.jsx, the other three
 are fine"), and it only reads sensibly on the newest checkpoint.
 
+### P9 · LSP + Problems
+
+Type errors now exist in Hearth — in the editor as squiggles, in a Problems
+panel, and in the agent's `get_errors`. Plan §4.5 calls this "the biggest single
+quality jump for both the human experience and the agent's error loop" and says
+don't defer it past P9; this is that.
+
+**It talks to `tsserver` directly rather than running
+`typescript-language-server`,** which plan §2 names. That wrapper wraps exactly
+this process, `typescript` was already a dependency here, and Monaco doesn't
+speak LSP either — so the wire format has to be translated into Monaco's shapes
+whichever end you start from. Going direct removes a dependency and a
+translation layer and adds nothing to write. It's also what VS Code's own
+TypeScript support does.
+
+- **Rust owns the framing, the frontend owns the protocol** — the same split as
+  `ollama_stream`, `run_dev` and the PTY. Fourth use of that shape. The framing
+  is asymmetric and nothing in the type system says so: newline-delimited JSON
+  going in, `Content-Length`-framed going out. A header with no length is
+  dropped rather than waited on, because it can never become valid and waiting
+  would stall every message behind it — the trap `take_utf8` already avoids for
+  bytes.
+- **The project's own TypeScript wins** when it has one: that's the version its
+  code was written against. Otherwise Hearth's, found by walking up from the
+  working directory.
+- **Monaco's built-in TypeScript worker had to be switched off**, not just
+  ignored. It runs in the browser with no filesystem, so it reports "Cannot find
+  module 'react'" on every import in every file — squiggles that were already
+  there before this phase. Two sets where one is always wrong is worse than
+  either alone. `setModeConfiguration` turns off the four providers being
+  replaced and keeps completions and formatting, which it does fine. Note
+  `monaco.typescript`, not `monaco.languages.typescript`: 0.56 moved these to a
+  top-level namespace and left the old path as a stub that type-checks as
+  `{ deprecated: true }`.
+- **Whole-document `change`, not a diff.** tsserver tracks an open file as a
+  buffer, so edits arrive as ranges — and the range has to describe what
+  tsserver currently believes, not what the editor now shows. Replacing
+  everything from the content last sent keeps them in step without diffing.
+  Off by one here and the buffer desynchronises permanently, putting every later
+  diagnostic, hover and definition on the wrong token, which is why
+  `fullReplaceRange` is unit-tested and then tested again against the real
+  server.
+- **Diagnostics are keyed by file *and* kind.** One `geterr` emits a separate
+  event per kind, each complete for that kind. Keyed by file alone the semantic
+  pass arrives second and wipes the syntax errors that arrived first — a file
+  with a stray brace reads as clean.
+- **`geterrForProject`, not just the open files**, for the agent's check: an
+  edit in one file breaks another, and that's the whole reason to have a
+  compiler rather than a linter. Verified reporting errors in a file that was
+  never opened.
+- **Type checking happens on the buffer, before a save.** Squiggles appear as
+  you type, and the agent's project check reflects unsaved editor state — which
+  is consistent with its existing refusal to write over a dirty tab.
+- Go-to-definition across files opens the target tab and lands the cursor there.
+  Monaco can only navigate to a model it already holds, and this app builds one
+  per open tab, so the jump is stashed on the store and applied when that tab's
+  editor mounts — the editor that started it has been unmounted by then.
+  `navtree` feeds a document-symbol provider, which is Ctrl+Shift+O for free;
+  the outline panel and breadcrumbs plan §4.1 also asks for can hang off the
+  same provider whenever there's somewhere to put them.
+
+**The scaffold changed, because otherwise none of this fires.** Measured, not
+assumed: a JS project with no `tsconfig`/`jsconfig` gets filed under an inferred
+project and reports **zero** diagnostics — indistinguishable from a clean one.
+The template now ships a `jsconfig.json` with `checkJs`, plus `@types/react`
+and `@types/react-dom` — without React's types every JSX file stops at "Cannot
+find module 'react'" before reaching a real mistake. On a scaffold broken four
+ways, what comes back:
+
+```
+13:15 [2322] Property 'onclick' does not exist on type '…ButtonHTMLAttributes…'. Did you mean 'onClick'?
+14:11 [2304] Cannot find name 'missingThing'.
+15:28 [2554] Expected 0-1 arguments, but got 2.
+```
+
+That first one is the case that justifies the whole phase: `onclick` compiles,
+runs, logs nothing, and produces a button that silently does nothing. Neither
+the build nor the browser console can see it. The second is the *exact* runtime
+crash the P4 console bridge was verified against — now caught before the app is
+run at all.
+
+**"Not checked" and "no errors" are different answers**, and this is the third
+place that rule has had to be enforced (after `devLogTail` and `consoleTail`).
+There are four states, because a model that can't tell them apart reports an
+unchecked project as a fixed one: no server, no config, nothing checked yet, and
+actually clean.
+
+Parsing and the agent's view live in
+[`problems.ts`](hearth-app/src/lib/problems.ts), import-free and unit-tested like
+the other parsing modules; the client is [`lsp.ts`](hearth-app/src/lib/lsp.ts)
+and the editor wiring [`monaco-ts.ts`](hearth-app/src/lib/monaco-ts.ts).
+
+**That split is load-bearing, not tidiness.** Monaco dies on
+`window is not defined` under plain node, and the P10 probe imports `agent.ts`
+— which now reaches the language server for `get_errors`. Importing Monaco
+anywhere in that graph breaks the probe, so `monaco-ts.ts` subscribes to the
+store instead of being called by it.
+
+**Verified against the real server at three levels**, because hand-written
+diagnostic fixtures are exactly where a parser's assumptions go unchallenged:
+the Rust suite spawns tsserver the way `ts_start` does and reads a real
+diagnostic back (`cargo test tsserver`); `problems.live.test.ts` drives the full
+open → check → change → re-check sequence through the app's own parser and
+asserts on the string the agent actually reads, including that a fix in an
+unsaved buffer clears it; and the built frontend was loaded in a browser to
+confirm the moved `monaco.typescript` namespace resolves at runtime.
+
+**The probe was updated, not just re-run.** Its `get_errors` returned only the
+dev log while the app's returns three sources — the drift it exists to prevent.
+It now composes the same three formatters. gemma4 with the new prompt:
+
+| model | trace | wall | heading applied |
+|---|---|---|---|
+| gemma4:latest | `read_file → edit_file → get_errors[1] → edit_file → get_errors[2] → finish` | 13.1s | yes |
+
+Reads before editing, checks, repairs, re-checks — and faster than the 16–20s
+recorded before, on a longer tool result.
+
+Not in this cut: an outline panel and breadcrumbs, rename refactor, and
+find-references — all three are requests away now that the client exists, and
+all three want UI that doesn't exist yet. Nor is there a bundled `tsserver.js`
+for a packaged build: it's found by walking up from the working directory, which
+works under `tauri dev` and finds nothing in a packaged app. That reports as
+"unavailable" rather than as a clean project, and the fix is a Tauri resource at
+packaging time — marked in the code.
+
 ---
 
 ## Remaining work
@@ -719,13 +845,17 @@ yet.*
       (above), backed by a git repo at `.hearth/git` rather than a snapshot
       store, with whole-checkpoint restore. Still open: accept/reject per hunk
       and editor decorations during agent writes.
-- [ ] **P9 · LSP + Problems** — `typescript-language-server` sidecar,
-      diagnostics into Monaco + Problems panel + agent's `get_errors()`.
-      Plan explicitly says don't defer this past P9.
-- [~] **P10 · Error feedback loop** — `get_errors()` reads the dev server log
-      and the preview's browser console (above). Still open: merging in LSP
-      diagnostics (needs P9), capped auto-repair rounds, and loop detection —
-      today the only brake is P7's 12-step cap.
+- [x] **P9 · LSP + Problems** — done (above): a `tsserver` sidecar rather than
+      `typescript-language-server` (it wraps the same process, and `typescript`
+      was already a dependency), diagnostics into Monaco and a Problems panel,
+      hover, go-to-definition, and document symbols behind Ctrl+Shift+O. The
+      scaffold gained a `jsconfig.json` and React types, without which a JS
+      project reports no diagnostics at all. Still open from plan §4.5: rename
+      refactor and find-references, both a request away now the client exists.
+- [~] **P10 · Error feedback loop** — all three sources merged: `get_errors()`
+      now reads type errors, the dev server log and the preview's browser
+      console. Still open: capped auto-repair rounds and loop detection — today
+      the only brake is P7's 12-step cap.
 
 ### Milestone D — polish
 
@@ -783,9 +913,11 @@ they don't get silently decided by momentum.
    it, since llama3.1:8b ignores the tool entirely.
 4. **~~P1 scope-creep candidates.~~** Command palette is done (see above), a
    phase later than this item suggested. Still open from P1's deferred list:
-   split/diff view, find/replace in the editor, breadcrumbs and symbol
-   outline — the last two are cheaper once P9's LSP exists, so they're worth
-   holding rather than hand-rolling.
+   split/diff view, and find/replace in the editor. Breadcrumbs and symbol
+   outline were being held for P9's LSP, which now exists — the document-symbol
+   provider behind Ctrl+Shift+O is already fed by `navtree`, so what's left is
+   somewhere to render it rather than anything to compute. The bottom dock is
+   the obvious place, and it grew a tab strip with the Problems panel.
 
 ---
 
@@ -818,12 +950,14 @@ cd hearth-app && npm run tauri dev
 
 ```bash
 # Unit tests: path safety, search/replace, session packing, context sizing,
-# dev-log parsing, pull progress, fenced-code splitting, checkpoint name-status
+# dev-log parsing, pull progress, fenced-code splitting, checkpoint name-status,
+# diagnostic folding — plus one that drives a real tsserver end to end
 cd hearth-app && npm test
 ```
 
 ```bash
-# Rust tests: NDJSON and PTY framing, a real shell spawned in a real PTY, and
-# the whole checkpoint sequence against a real git repo
+# Rust tests: NDJSON, PTY and Content-Length framing, a real shell in a real
+# PTY, a real tsserver reporting a real type error, and the whole checkpoint
+# sequence against a real git repo
 cd hearth-app/src-tauri && cargo test --no-default-features
 ```

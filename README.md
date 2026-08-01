@@ -9,7 +9,7 @@ Two things live here today:
 
 | | what it is | status |
 |---|---|---|
-| [`hearth-app/`](hearth-app) | the Tauri + React desktop app — file tree, Monaco tabs, save, and an agent that edits the open project | P1 done, first cut of the agent |
+| [`hearth-app/`](hearth-app) | the Tauri + React desktop app — file tree, Monaco tabs, terminal, dev server, preview, type checking, and an agent that edits the open project | through P9; P3/P4 partial |
 | [`p0-spike/`](p0-spike) | headless harness that scores a local model on a multi-step tool loop | P0 done |
 
 ## Prerequisites
@@ -53,16 +53,26 @@ worth checking before blaming a model for being slow. Models that can't call
 tools (base models, most Gemma builds) fail with an Ollama error rather than
 misbehave quietly.
 
-Not there yet: no approval prompt before a write (use git), no terminal or
-test-running, no diff review UI, and **Stop** ends the run after the current
-step rather than interrupting it.
+The agent checks its own work rather than waiting to be told what broke.
+`get_errors` hands it type errors from the TypeScript compiler, the dev
+server's build output, and the running page's browser console — so a
+misspelled `onclick`, which compiles and logs nothing, is caught alongside a
+crash. It can also run the project's own tooling (`npm test`, `npx tsc
+--noEmit`) through an allowlist. Every turn that changes a file becomes a
+checkpoint you can diff and roll back.
+
+Not there yet: no approval prompt before a write (there are checkpoints
+instead), and **Stop** ends the run after the current step rather than
+interrupting it.
 
 ```bash
 cd hearth-app && npm test
 ```
 
-runs the path-safety and search/replace unit tests; `cargo test` in
-`src-tauri/` covers the response framing.
+runs the unit tests — path safety, search/replace, context sizing, log and
+diagnostic parsing — plus one that drives a real `tsserver` end to end.
+`cargo test --no-default-features` in `src-tauri/` covers the process and
+framing layers against real shells, repos and servers.
 
 To produce an installer instead:
 

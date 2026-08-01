@@ -5,6 +5,7 @@ import { samePath } from "./edit";
 import { createProject, defaultWorkspaceDir } from "./projects";
 import { packTab, rebaseTab, type Tab } from "./session";
 import { useRunner } from "./runner";
+import { useLsp } from "./lsp";
 
 export type { Tab };
 
@@ -63,6 +64,9 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
   // against the previous project would keep serving it under the new one's name.
   openFolder: async (root: string) => {
     await useRunner.getState().stop();
+    // Returns as soon as the process is spawned — tsserver then spends a second
+    // or two loading the compiler, which nothing here has to wait for.
+    await useLsp.getState().start(root);
     const children = await listDir(root);
     set({
       projectRoot: root,
@@ -84,6 +88,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
 
   closeProject: () => {
     void useRunner.getState().stop();
+    void useLsp.getState().stop();
     set({ projectRoot: null, dirChildren: {}, expandedDirs: new Set(), tabs: [], activePath: null, diff: null });
   },
 
@@ -121,6 +126,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
       return;
     }
     const content = await readTextFile(path);
+    useLsp.getState().touch(path, content);
     set((state) => ({
       tabs: [...state.tabs, { path, name, content, savedContent: content }],
       activePath: path,
@@ -130,10 +136,15 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
 
   setActivePath: (path: string) => set({ activePath: path, diff: null }),
 
-  setTabContent: (path: string, content: string) =>
+  // tsserver checks the buffer, not the file: type errors show up as they're
+  // typed, before a save, which is the whole reason it holds open files in
+  // memory. `touch` debounces the re-check.
+  setTabContent: (path: string, content: string) => {
+    useLsp.getState().touch(path, content);
     set((state) => ({
       tabs: state.tabs.map((t) => (t.path === path ? { ...t, content } : t)),
-    })),
+    }));
+  },
 
   saveTab: async (path: string) => {
     const tab = get().tabs.find((t) => t.path === path);
@@ -168,6 +179,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
     const { tabs, activePath } = get();
     const idx = tabs.findIndex((t) => t.path === path);
     if (idx === -1) return;
+    useLsp.getState().close(path);
     const nextTabs = tabs.filter((t) => t.path !== path);
     let nextActive = activePath;
     if (activePath === path) {
@@ -215,6 +227,12 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
       }),
     );
     const liveTabs = restored.filter((t): t is Tab => t !== null);
+
+    // Reopening the app lands here instead of in `openFolder`, so without this
+    // a restored session would have no language server at all — no squiggles,
+    // no hover, and an agent told there are no type errors.
+    await useLsp.getState().start(projectRoot);
+    for (const tab of liveTabs) useLsp.getState().touch(tab.path, tab.content);
 
     set({
       dirChildren,

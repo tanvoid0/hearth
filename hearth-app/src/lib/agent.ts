@@ -5,12 +5,13 @@ import { contextLimits, packHistory } from "./session";
 import { useHearthStore } from "./store";
 import { useRunner } from "./runner";
 import { consoleTail, devLogTail } from "./runlog";
+import { hasChecked, useLsp } from "./lsp";
+import { problemTail } from "./problems";
 import { runCommand } from "./terminal";
 
-// Tool surface is P0's validated set (build plan §5), plus `get_errors` — which
-// reads the dev server's output and the preview's browser console — and
-// `run_command`. Plan §10 has LSP diagnostics merging into `get_errors` at P9;
-// `search` arrives with P11.
+// Tool surface is P0's validated set (build plan §5), plus `get_errors` — now
+// all three of plan §10's sources merged: type errors, the dev server's output
+// and the preview's browser console. `search` arrives with P11.
 export const TOOL_DEFS = [
   {
     type: "function",
@@ -81,7 +82,7 @@ export const TOOL_DEFS = [
     function: {
       name: "get_errors",
       description:
-        "Read the dev server's recent output and the running app's browser console. Build errors, failed imports and startup problems come from the first; crashes, blank pages and React warnings come from the second. Call this after editing files to check the change compiles AND runs.",
+        "Check the project for errors from three sources: the TypeScript compiler (undefined names, wrong arguments, misspelled props — reported for every file, whether or not the app is running), the dev server's build output, and the running app's browser console. Call this after editing files to check the change compiles AND runs.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -187,6 +188,10 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
           return { ok: false, output: `edit_file failed, no changes applied:\n${failures.join("\n\n")}` };
         }
         await writeTextFile(target, content);
+        // Tell tsserver before the next get_errors asks it. It holds open files
+        // in memory, so a write it doesn't hear about is a file it keeps
+        // type-checking at its previous contents.
+        useLsp.getState().touch(target, content);
         await useHearthStore.getState().syncFromDisk(target);
         return { ok: true, output: `applied ${edits.length} edit(s) to ${args?.path}` };
       }
@@ -199,14 +204,23 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
           };
         }
         await writeTextFile(target, args?.content ?? "");
+        useLsp.getState().touch(target, args?.content ?? "");
         await useHearthStore.getState().syncFromDisk(target);
         return { ok: true, output: `created ${args?.path}` };
       }
       case "get_errors": {
+        // Type errors first: they cover every file rather than only the one
+        // being served, and they exist before the app is ever run.
+        await useLsp.getState().checkProject();
+        const { status, problems } = useLsp.getState();
         const { running, url, log, consoleAttached, consoleLog, consoleMark } = useRunner.getState();
         return {
           ok: true,
-          output: [devLogTail(running, url, log), consoleTail(consoleAttached, consoleLog, consoleMark)].join("\n\n"),
+          output: [
+            problemTail(status === "ok" && !hasChecked() ? "idle" : status, problems, root),
+            devLogTail(running, url, log),
+            consoleTail(consoleAttached, consoleLog, consoleMark),
+          ].join("\n\n"),
         };
       }
       case "run_command": {
@@ -277,9 +291,10 @@ export function systemPrompt(root: string, activeFile?: string | null): string {
     'the "finish" tool with a short summary. Work in as few steps as needed. Always read a file',
     "with read_file before editing it — never guess its contents. Use edit_file for existing files",
     "and write_file only for brand-new files. All paths are relative to the project root.",
-    "After you change a file, call get_errors. It reports both the dev server's build output and",
-    "the running page's browser console — code that compiles can still crash on load. Fix anything",
-    "it reports and check again before finishing.",
+    "After you change a file, call get_errors. It reports type errors from the TypeScript compiler,",
+    "the dev server's build output, and the running page's browser console — code that compiles can",
+    "still crash on load, and a type error is reported whether or not the app is running. Fix",
+    "anything it reports and check again before finishing.",
     "Use run_command for anything that needs to actually execute — the test suite, a type check,",
     "a build. Prefer it over asking the user to run something and paste the result back.",
     activeFile ? `The user currently has ${activeFile} open in the editor.` : "",

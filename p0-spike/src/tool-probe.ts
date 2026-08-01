@@ -20,7 +20,8 @@ import path from "node:path";
 import { chat, type ChatMessage } from "./ollama.js";
 import { TOOL_DEFS, systemPrompt } from "../../hearth-app/src/lib/agent.ts";
 import { applyEdits } from "../../hearth-app/src/lib/edit.ts";
-import { devLogTail } from "../../hearth-app/src/lib/runlog.ts";
+import { consoleTail, devLogTail } from "../../hearth-app/src/lib/runlog.ts";
+import { problemTail } from "../../hearth-app/src/lib/problems.ts";
 
 const MAX_ITERATIONS = 12;
 
@@ -104,7 +105,18 @@ export async function probe(model: string): Promise<ProbeResult> {
         return `created ${rel}`;
       case "get_errors":
         errorCalls++;
-        return devLogTail(true, "http://localhost:5173/", errorCalls === 1 ? BROKEN_LOG : CLEAN_LOG);
+        // All three of the app's sources, through the app's own formatters —
+        // the model has to see the shape it will really be handed, or the
+        // instruction-following this measures is being measured against a
+        // different tool. Type checking reports clean because the task's edit
+        // introduces no type error; the dev log is the canned thing to react to,
+        // and no preview is attached in a probe, which `consoleTail` says
+        // rather than passing off as silence.
+        return [
+          problemTail("ok", [], root),
+          devLogTail(true, "http://localhost:5173/", errorCalls === 1 ? BROKEN_LOG : CLEAN_LOG),
+          consoleTail(false, []),
+        ].join("\n\n");
       case "run_command": {
         // The app runs this through Rust, behind an allowlist. Here it only has
         // to be answerable — a model that calls it and gets "unknown tool" back
