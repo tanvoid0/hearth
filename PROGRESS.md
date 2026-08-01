@@ -1106,6 +1106,80 @@ bulk rewrite the user starts has no undo boundary — checkpoints are per agent
 turn — and the agent's own edit path already does project-wide changes with one
 behind it. Build it when there's an undo for it, not before.
 
+### tsserver ships with the app now
+
+Type checking worked under `tauri dev` and reported "unavailable" in a packaged
+build: `tsserver.js` was found by walking up from the working directory, and
+there's no `node_modules` above an installed executable. Honest, and the
+majority of projects, and the entire point of P9.
+
+`node_modules/typescript/lib` is a bundled resource, tried after the project's
+own copy and before the walk-up. **Verified by building the installers and
+querying the MSI's file table** rather than by reading the config back: 124
+files, `tsserver.js` and the `lib.*.d.ts` set among them.
+
+`node` itself is still expected on PATH. Bundling a runtime is a different order
+of work, and every project Hearth runs already needs node for the package
+manager and the dev server.
+
+### Transcripts moved into the project
+
+The 200k-char budget on chat history was a *localStorage quota* number that was
+silently also a history limit — the same shape of bug as `HISTORY_BUDGET` being
+sent to the model. It existed because the old store held every project's
+conversation in one blob and rewrote all of it on every entry, so the trim
+wasn't a policy about how much history is worth keeping. It was the price of the
+storage.
+
+Transcripts are now `.hearth/chat.jsonl` in the project they belong to, appended
+a line at a time. Nothing is trimmed: `LOAD_LIMIT` bounds what the panel reads
+back and the file keeps the rest.
+
+- **The model-facing half stays a snapshot** in `.hearth/chat-session.json` —
+  history, and any turn interrupted mid-flight. That's what it is, and it's
+  already bounded by the context budget; an append-only copy of it would be a
+  log of previous guesses.
+- **A line that won't parse is skipped, not thrown on.** Killing the app
+  mid-append leaves a half-written last line, and losing every conversation in a
+  project to one truncated line would be the worst bug available here. It has
+  its own test, in [`transcript.ts`](hearth-app/src/lib/transcript.ts) with the
+  other import-free parsing modules.
+- **Writes go through a queue.** Appends are dispatched from a synchronous store
+  action, so two entries landing in the same tick would race into the same file.
+  Failures are swallowed: losing the on-disk copy of a turn is bad, losing the
+  turn itself because a write failed is worse.
+- **Hydration hangs off `rehydrateFromDisk` as well as `openFolder`**, which is
+  the one that's easy to miss — reopening the app restores a project without
+  going through `openFolder`, and the language server needed the same treatment
+  for the same reason. The comment there now says so for both.
+- An existing conversation in `localStorage` is imported the first time its
+  project is opened, so a version bump doesn't look like lost history.
+
+**Not `tauri-plugin-sql`, which is what the plan names.** What SQLite buys over
+this is queryability across projects, and nothing in the UI asks that question
+yet; what it costs is two dependencies, a migration, and an async rewrite of a
+store that works — reviewed against a running app I'd have to trust rather than
+test. The trim is gone either way, and that was the felt problem. If
+"search my past conversations" gets built, the rows are already one JSON object
+per line to import.
+
+### The split editor — P1's last deferral
+
+`Ctrl+\` pins the file you're looking at into a second pane, so moving around in
+the main one leaves it in view. The palette has it too.
+
+- **One extra path in the store, not a second tab bar.** The parked reason for
+  not doing this was "two active paths and a tab bar per pane"; the tab bar is
+  what makes it expensive and it isn't what a split is for. A pane with its own
+  tabs is a second editor to keep in step, rather than a second view.
+- **The two panes share Monaco's model registry**, which is keyed by path — so
+  splitting a file against itself is two views of one buffer rather than two
+  buffers racing to save the same file.
+- **The split pane sits out anything global.** A diff takes over the main pane
+  only, and a go-to-definition jump moves the main pane only: both fire on a
+  store change, and two panes handling them would race with the second winning.
+  Closing a tab closes a split pinned to it.
+
 ---
 
 ## Remaining work
@@ -1146,7 +1220,13 @@ decisions rather than backlog.
       own control.
 - [x] **P6 · Chat** — streaming chat, code-block and inline-code rendering, and
       transcripts that survive a restart, kept per project.
-- [~] **P6 · conversation persistence via `tauri-plugin-sql`** — the one item
+- [x] **P6 · unbounded conversation persistence** — transcripts live in the
+      project as appended JSONL and are no longer trimmed (above). **Not
+      `tauri-plugin-sql`**, which is what the plan names: what SQLite adds over
+      this is queryability across projects, and nothing asks that question yet.
+      The reasoning this replaces is kept below, because the part of it that was
+      right is why the file format is one JSON object per line.
+- [~] ~~**P6 · conversation persistence via `tauri-plugin-sql`**~~ — the one item
       still genuinely open, and it stays open on purpose. Transcripts already
       survive restarts in `localStorage`, keyed per project and trimmed to a
       200k-char budget. SQLite buys unbounded history and queryability across
@@ -1197,15 +1277,20 @@ decisions rather than backlog.
 
 ### Not a phase, but still open
 
-- **Split editor.** P1's deferred "split/diff view" is half done: the diff half
-  is a palette command comparing the open buffer against the last checkpoint,
-  which is the question people actually have (what did the agent change here).
-  A real side-by-side split needs two active paths and a tab bar per pane, in a
-  main area already time-shared between editor, diff and preview. Worth doing
-  when the pane stops being the scarce thing.
+- **~~Split editor.~~** Done (above). The parked reason was "two active paths
+  and a tab bar per pane" — the tab bar is the expensive half and isn't what a
+  split is for, so the pane is pinned to one path and has none.
 - **Find/replace** was on the same deferred list and turns out to need nothing:
   Monaco's own Ctrl+F and Ctrl+H work, and the widget is better than anything
   worth writing here.
+- **The console bridge is still vite-only**, and the non-vite case is now the
+  only Milestone-A gap left. A Next or webpack project runs and previews; it
+  just has no console capture, which `consoleTail` reports rather than passing
+  off as silence.
+- **The spike measures the model without the app around it.** Its tool set is
+  P0's five, so the four broken-syntax failures in the 20-task run are ones the
+  app's type check and auto-repair would catch. Scoring the same tasks through
+  the real loop is the measurement that would say how much those are worth.
 
 ---
 
@@ -1234,14 +1319,59 @@ they don't get silently decided by momentum.
    loop and is the most careful of the three, but at 74% GPU it costs 227s
    against gemma4's 16–20s for the same result. **Default: gemma4.**
 
-   What that leaves: the 14B–24B-Q4 band, which is where a model might beat
-   gemma4's quality while staying under the line — nothing in it is pulled.
-   The plan's §10 suggestion, `devstral:24b`, is the obvious first pull, and
-   the probe now scores this exact question in about a minute per model.
-2. **Widen the P0 task set.** Current harness has 8 tasks / 2 models; the
-   plan calls for "20 tasks × 3 models." Worth doing once a faster model
-   candidate is in the mix — no point widening against a model (qwen:latest)
-   that's already disqualified for lacking tool support.
+   What that left: the 14B–24B-Q4 band, which is where a model might beat
+   gemma4's quality while staying under the line.
+
+   **Closed. `devstral:24b` is pulled and measured, and it doesn't hold the
+   loop.** Three probe runs per scenario, `ollama ps` checked during them:
+
+   | model | resident | GPU split | heading: edit applied | called `finish` | unfamiliar: applied |
+   |---|---|---|---|---|---|
+   | gemma4:latest | 3.4 GB | 100% | 2/2 | 2/2 | 2/2 |
+   | devstral:24b | 15 GB | **90%** (10% CPU) | 3/3 | **0/3** | **0/3** |
+   | llama3.1:8b | 5.9 GB | 100% | 0/1 | 0/1 | 0/1 |
+
+   devstral is not slow and not confused — on the unfamiliar project it
+   reaches for `search` and reads the right file, in 5–7s. Then it stops
+   replying. Every run ends `no_tool_call`, which is llama3.1:8b's failure
+   at three times the size: the turn is abandoned rather than finished, so
+   P10's brake — which hangs off `finish` — never fires. On the harder
+   scenario it abandons before editing at all, so nothing lands.
+
+   The 15 GB also doesn't fit: 90/10 at `num_ctx` 8192, and the KV cache
+   grows from the same 16 GB, so a bigger window makes it worse.
+
+   That closes the band the plan pointed at. **Default stays gemma4**, now on
+   two scenarios rather than one. What isn't measured is whether devstral
+   holds a loop in the scaffold it was trained for — this scores it in
+   Hearth's, which is the question Hearth has.
+2. **~~Widen the P0 task set.~~** Done: 20 tasks, and `npm run check-tasks`
+   asserts every one of them fails on an untouched fixture — a verify that
+   passes without the model having done anything scores every model as
+   correct, and the table is the whole output of the spike.
+
+   **gemma4 scores 12/20 (60%)**, 0 malformed JSON, 0 wrong-tool calls, 2
+   failed diffs, 3.6 iterations and 7.9s per task. The interesting half is the
+   8 failures, which split evenly:
+
+   - **4 wrote syntactically broken TypeScript** — a stray `}`, a `return` at
+     top level, a mangled newline. Not a diff that failed to apply: the edit
+     landed and the file no longer parses.
+   - **4 are wrong answers** — the empty-array guard that still returns `NaN`,
+     an off-by-one "fixed" to the same value, two new files never re-exported.
+
+   The first group is the one to read carefully, because **the spike has no
+   safety net**: its tool set is P0's five, so there's no `get_errors`, no type
+   check and no auto-repair round. Those four are exactly what P9 and P10 were
+   built to catch, and the app has both. 60% is the model without the app.
+   Running the same tasks through the app's loop is the obvious next
+   measurement, and it's a bigger harness than this one.
+
+   The app's own `applyEdits` was checked directly against this, since a
+   corrupting edit path would look identical from here: handed a real
+   multi-line insertion from gemma4, it produced exactly the intended file.
+   `tools.ts` now imports it rather than keeping the copy that was diffed
+   against it.
 3. **~~The agent can't see the runner it now sits next to.~~** Decided: took
    the shortcut. `get_errors` reads the dev-server log now, ahead of the LSP,
    and gemma4 runs the full edit→check→fix→re-check loop with it (see above).
@@ -1254,29 +1384,52 @@ they don't get silently decided by momentum.
    editor is left, and it's parked for a reason rather than forgotten — see
    "Not a phase, but still open" above.
 
-5. **What the agent does with the tools it just grew.** `search`, `repo_map`
-   and PLAN all landed together, and all three change what a turn costs and how
-   it goes wrong — PLAN adds a call, `repo_map` can return a few hundred lines,
-   and a model that reaches for `search` instead of reading three files spends
-   its context differently. The tool-probe measures one thing (does it check its
-   own work) and won't see any of that. Worth a second probe task on an
-   unfamiliar multi-file project before assuming the additions are free.
+5. **~~What the agent does with the tools it just grew.~~** Answered by the
+   probe's second scenario: nine files across directories, and a task that
+   names none of them.
+
+   **gemma4 searches rather than reads.** Both runs open with `search`, then
+   read one or two files — not the nine it would have to walk otherwise — and
+   the whole turn costs 11–15s against 9–14s for the trivial one. So the P11
+   tools are close to free and are being used the way they were meant to be.
+
+   `repo_map` was never called by any model on either scenario. That isn't a
+   verdict on it — a nine-file project is one `search` away from an answer, and
+   the map earns its keep on repos too big to search blindly — but nothing here
+   has measured it doing so.
+
+   Two harness bugs fell out of running it, both of which would have skewed
+   what it reported. The probe had no loop detection, so a model re-applying an
+   edit that no longer matched got the same failure until the iteration cap; it
+   uses the app's own `stalled` now. And `finish` was bounced whenever the
+   canned build hadn't been "repaired" — which a model that got it right on its
+   *first* edit can never satisfy, since it has nothing left to change. It
+   burned all three repair rounds being told to fix an already-correct file.
+   The finish check now asks the scenario whether the task is actually done,
+   which is what the app checks too.
 
 ---
 
 ## How to resume
 
 ```bash
-# Score a model on the loop that matters: does it check its own work after
-# editing? ~20s for a model that fits, minutes for one that doesn't.
-cd p0-spike && npm run probe -- gemma4:latest llama3.1:8b
+# Score a model on the two loops that matter: does it check its own work after
+# editing (heading), and does it find a file nobody named (unfamiliar). Both
+# scenarios per model unless --scenario narrows it. ~30s for a model that fits.
+cd p0-spike && npm run probe -- gemma4:latest devstral:24b
 ```
 
 ```bash
-# The wider P0 spike — 8 tasks, pass/fail on actually running the result.
-# Scores correctness, not instruction-following; slower, and the table it
-# produces still names models that are no longer pulled here.
+# The wider P0 spike — 20 tasks, pass/fail on actually running the result.
+# Scores correctness, not instruction-following, and without get_errors or a
+# type check in front of it. ~3 minutes for gemma4.
 cd p0-spike && npm run spike -- gemma4:latest
+```
+
+```bash
+# Run after touching tasks.ts or the fixture: every task must fail on an
+# untouched fixture, or the spike scores every model as correct.
+cd p0-spike && npm run check-tasks
 ```
 
 ```bash
@@ -1292,10 +1445,11 @@ cd hearth-app && npm run tauri dev
 ```
 
 ```bash
-# Unit tests (101): path safety, search/replace, session packing, context
-# sizing, run-state machine, dev-log and missing-package parsing, pull progress, fenced-code
-# splitting, checkpoint name-status, hunk parsing, repo-map extraction, .env
-# redaction, diagnostic folding — plus one that drives a real tsserver end to end
+# Unit tests (106): path safety, search/replace, session packing, context
+# sizing, run-state machine, dev-log and missing-package parsing, pull progress,
+# fenced-code splitting, checkpoint name-status, hunk parsing, repo-map
+# extraction, .env redaction, diagnostic folding, transcript framing — plus one
+# that drives a real tsserver end to end
 cd hearth-app && npm test
 ```
 
@@ -1305,4 +1459,11 @@ cd hearth-app && npm test
 # a real tsserver reporting a real type error, and the whole checkpoint sequence
 # against a real git repo
 cd hearth-app/src-tauri && cargo test --no-default-features
+```
+
+```bash
+# Package it. Worth running after touching bundle.resources — type checking in
+# an installed build depends on tsserver.js actually landing in there, which
+# only this says.
+cd hearth-app && npm run tauri build
 ```
