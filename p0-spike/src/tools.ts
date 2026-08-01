@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { applyEdits, type Edit } from "../../hearth-app/src/lib/edit.ts";
+import { applyEdits, type Edit } from "../../src/lib/edit.ts";
 
 export type { Edit };
 

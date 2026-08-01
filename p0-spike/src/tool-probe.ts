@@ -7,29 +7,21 @@
 //
 //   npm run probe -- gemma4:latest llama3.1:8b
 //
-// It imports the app's real TOOL_DEFS / systemPrompt / applyEdits / devLogTail
-// rather than copies, so it can't drift out of step with what ships. The file
-// tools are reimplemented on node fs because the app's own dispatchTool goes
-// through Tauri invoke, which has no meaning outside the app — and the file
-// layer isn't what's under test here.
+// The loop itself is the app's, via `appLoop` — see app-loop.ts. What lives
+// here is the *world* it runs in: a small canned one, so a run is
+// deterministic. The file tools are reimplemented on node fs because the app's
+// own dispatchTool goes through Tauri invoke, which has no meaning outside the
+// app — and the file layer isn't what's under test here.
 
 import { spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { chat, type ChatMessage } from "./ollama.js";
-import { TOOL_DEFS, systemPrompt } from "../../hearth-app/src/lib/agent.ts";
-import { stalled } from "../../hearth-app/src/lib/session.ts";
-import { applyEdits } from "../../hearth-app/src/lib/edit.ts";
-import { consoleTail, devLogTail } from "../../hearth-app/src/lib/runlog.ts";
-import { problemTail } from "../../hearth-app/src/lib/problems.ts";
-import { exportedSymbols, formatRepoMap, isSourceFile } from "../../hearth-app/src/lib/repomap.ts";
-
-const MAX_ITERATIONS = 15;
-// Same cap the app applies to auto-repair rounds (build plan §6).
-const MAX_REPAIR_ROUNDS = 3;
-// And the same one it applies to a call that keeps returning the same answer.
-const MAX_IDENTICAL_CALLS = 3;
+import { appLoop, type ToolResult, type World } from "./app-loop.js";
+import { applyEdits } from "../../src/lib/edit.ts";
+import { consoleTail, devLogTail } from "../../src/lib/runlog.ts";
+import { problemTail } from "../../src/lib/problems.ts";
+import { exportedSymbols, formatRepoMap, isSourceFile } from "../../src/lib/repomap.ts";
 
 // A real vite transform error, as it appears on the dev server's stdout. Canned
 // rather than provoked: the point is a deterministic broken build to react to,
@@ -150,15 +142,11 @@ export async function probe(model: string, scenario: Scenario = HEADING): Promis
   const root = await scaffold(FILES);
   // A small canned world, so the run is deterministic: the build is broken, and
   // an edit fixes it only once the model has actually been shown the error.
-  // `told` is set by get_errors *and* by a bounced finish — being handed the
-  // error by the repair round is the same information.
+  // `told` is set by get_errors *and* by a bounced finish, which carry the same
+  // information.
   let told = false;
   let repaired = false;
-  let errorCalls = 0;
-  let repairRounds = 0;
   const commandCalls: string[] = [];
-  const trace: string[] = [];
-  const signatures: string[] = [];
   const readRel = (rel: string) => fs.readFile(path.join(root, rel), "utf8").catch(() => "");
 
   /** What the app's get_errors returns, through the app's own formatters. */
@@ -218,16 +206,15 @@ export async function probe(model: string, scenario: Scenario = HEADING): Promis
         // introduces no type error; the dev log is the canned thing to react to,
         // and no preview is attached in a probe, which `consoleTail` says
         // rather than passing off as silence.
-        errorCalls++;
         told = true;
         return errorReport();
       case "run_command": {
         // The app runs this through Rust, behind an allowlist. Here it only has
         // to be answerable — a model that calls it and gets "unknown tool" back
         // would skew the measurement this probe exists for.
-        commandCalls.push(String(args?.command ?? ""));
-        const [program, ...rest] = String(args?.command ?? "").split(/\s+/);
-        const done = spawnSync(program, rest, { cwd: root, encoding: "utf8", shell: true, timeout: 60_000 });
+        const command = String(args?.command ?? "");
+        commandCalls.push(command);
+        const done = spawnSync(command, { cwd: root, encoding: "utf8", shell: true, timeout: 60_000 });
         return `exited ${done.status ?? -1}\n\n${(done.stdout ?? "") + (done.stderr ?? "") || "(no output)"}`;
       }
       default:
@@ -235,103 +222,46 @@ export async function probe(model: string, scenario: Scenario = HEADING): Promis
     }
   }
 
-  // Mirrors dispatchTool's outer try/catch: a throwing tool is an error message
-  // the model gets a chance to recover from, not a dead run.
-  const dispatch = (name: string, args: any) =>
-    run(name, args).catch((err: Error) => `error: ${err.message}`);
-
-  const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt(root, scenario.open) },
-    { role: "user", content: scenario.task },
-  ];
+  const world: World = {
+    // Mirrors dispatchTool's outer try/catch: a throwing tool is an error
+    // message the model gets a chance to recover from, not a dead run.
+    dispatch: (name, args): Promise<ToolResult> =>
+      run(name, args).then(
+        (output) => ({ ok: !output.startsWith("error:") && !output.startsWith("edit_file failed"), output }),
+        (err: Error) => ({ ok: false, output: `error: ${err.message}` }),
+      ),
+    // Ground truth is part of the verdict, not just `repaired`. The canned
+    // world only clears on a successful edit made *after* being shown the
+    // error — so a model that got it right on its first edit has nothing left
+    // to change, every later edit fails to match, and it would burn all three
+    // rounds being told to fix an already-fixed file. The app checks real
+    // errors here; the probe checks whether the task is done.
+    verify: async () => {
+      const trulyDone = repaired || (await scenario.applied(readRel));
+      told = true;
+      return { blocking: trulyDone ? 0 : 1, report: errorReport() };
+    },
+  };
 
   const start = Date.now();
-  let finishedVia: ProbeResult["finishedVia"] = "max_iterations";
-
-  for (let i = 0; i < MAX_ITERATIONS; i++) {
-    const { message } = await chat(model, messages, TOOL_DEFS);
-    messages.push(message);
-    const calls = message.tool_calls ?? [];
-    if (calls.length === 0) {
-      finishedVia = "no_tool_call";
-      break;
-    }
-
-    let done = false;
-    for (const call of calls) {
-      const name = call.function.name;
-      let args: any = call.function.arguments;
-      if (typeof args === "string") {
-        try {
-          args = JSON.parse(args);
-        } catch {
-          trace.push(`${name}(bad JSON)`);
-          messages.push({ role: "tool", tool_name: name, content: "error: arguments were not valid JSON" });
-          continue;
-        }
-      }
-      trace.push(name === "get_errors" ? `get_errors[${errorCalls + 1}]` : name);
-      if (name === "finish") {
-        // Mirrors runAgent's VERIFY step: a finish that doesn't hold up gets
-        // handed the errors and bounced, up to the same cap. Without this the
-        // probe would be measuring a loop the app no longer runs.
-        //
-        // Ground truth is part of the test, not just `repaired`. The canned
-        // world only clears on a successful edit made *after* being shown the
-        // error — so a model that got it right on its first edit has nothing
-        // left to change, every later edit fails to match, and it would burn
-        // all three rounds being told to fix an already-fixed file. The app
-        // checks real errors here; the probe checks whether the task is done.
-        const trulyDone = repaired || (await scenario.applied(readRel));
-        if (!trulyDone && repairRounds < MAX_REPAIR_ROUNDS) {
-          repairRounds++;
-          told = true;
-          trace.push(`repair[${repairRounds}]`);
-          messages.push({
-            role: "tool",
-            tool_name: name,
-            content: `not finished — 1 error(s) still reported. Fix them, then call finish again.\n\n${errorReport()}`,
-          });
-          continue;
-        }
-        done = true;
-        messages.push({ role: "tool", tool_name: name, content: "turn finished" });
-        continue;
-      }
-      const output = await dispatch(name, args);
-      messages.push({ role: "tool", tool_name: name, content: output });
-
-      // The app's own loop detection, on the app's own helper. Without it the
-      // probe measures a loop the app doesn't run: a model that re-applies an
-      // edit which no longer matches gets the same failure forever, and every
-      // remaining iteration and repair round is spent on it.
-      signatures.push(`${name}:${JSON.stringify(args ?? null)}:${output}`);
-      if (stalled(signatures, MAX_IDENTICAL_CALLS)) {
-        trace.push("stalled");
-        done = true;
-        finishedVia = "loop_detected";
-      }
-    }
-    if (done) {
-      if (finishedVia !== "loop_detected") finishedVia = "finish_call";
-      break;
-    }
-  }
+  const run_ = await appLoop({ model, root, task: scenario.task, world, activeFile: scenario.open });
+  const wallSec = +((Date.now() - start) / 1000).toFixed(1);
 
   const applied = await scenario.applied(readRel).catch(() => false);
   await fs.rm(root, { recursive: true, force: true });
 
+  const { trace } = run_;
   const firstEdit = trace.findIndex((t) => t === "edit_file" || t === "write_file");
 
   return {
     model,
     scenario: scenario.id,
-    wallSec: +((Date.now() - start) / 1000).toFixed(1),
+    wallSec,
     trace: trace.join(" → "),
-    finishedVia,
+    finishedVia: run_.finishedVia,
     checkedAfterEdit: firstEdit >= 0 && trace.slice(firstEdit + 1).some((t) => t.startsWith("get_errors")),
-    rechecked: errorCalls >= 2,
-    repairRounds,
+    rechecked: trace.filter((t) => t.startsWith("get_errors")).length >= 2,
+    repairRounds: run_.repairRounds,
     applied,
     usedSearch: trace.includes("search"),
     usedRepoMap: trace.includes("repo_map"),

@@ -8,10 +8,13 @@ import { listLocalModels, OLLAMA_HOST } from "./ollama.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESULTS_DIR = path.resolve(__dirname, "..", "results");
 
-// Both tool-capable and locally pulled. Keep this list in sync with what's
-// actually installed — preflight() below fails loudly rather than letting a
-// stale name read as "this model scored 0/8".
-const DEFAULT_MODELS = ["qwen3-coder:30b", "llama3.1:8b"];
+// Tool-capable, locally pulled, and the one the measurements settled on: the
+// previous default pair was qwen3-coder:30b and llama3.1:8b, which is the
+// slowest model here (it spills to CPU) next to one that doesn't hold the loop
+// at all. A no-argument run should score the model you'd actually use.
+// Keep this in sync with what's installed — preflight() below fails loudly
+// rather than letting a stale name read as "this model scored 0/20".
+const DEFAULT_MODELS = ["gemma4:latest"];
 
 function parseModels(): string[] {
   const arg = process.argv[2];
@@ -25,7 +28,7 @@ function pct(n: number, d: number): string {
 }
 
 // A missing model fails identically to a model that can't hold the tool loop:
-// every task errors out and the summary reads 0/8. Check up front instead.
+// every task errors out and the summary reads 0/20. Check up front instead.
 async function preflight(models: string[]): Promise<void> {
   let local: string[];
   try {

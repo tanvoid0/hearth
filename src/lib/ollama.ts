@@ -84,6 +84,13 @@ export async function totalVramGb(): Promise<number | null> {
   return invoke<number | null>("gpu_total_vram_gb").catch(() => null);
 }
 
+/** How busy the GPU is right now, 0–100, or null when it can't be determined.
+ *  Not the same number as `LoadedModel.gpuPercent`, which is how much of the
+ *  model sits in VRAM — a model can be 100% resident and the card idle. */
+export async function gpuUtilizationPct(): Promise<number | null> {
+  return invoke<number | null>("gpu_utilization_pct").catch(() => null);
+}
+
 /** The loaded model matching `name`, or null if Ollama has nothing loaded for
  *  it — models unload on their own after a few idle minutes. */
 export async function loadedModel(name: string): Promise<LoadedModel | null> {

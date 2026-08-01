@@ -107,21 +107,18 @@ async fn ollama_unload(model: String) -> Result<(), String> {
     }
 }
 
-/// Total VRAM in GB, or `None` when we can't tell — no NVIDIA GPU, no driver,
-/// or a machine where this shells out to nothing.
+/// One `--query-gpu` field as a number, or `None` when we can't tell — no
+/// NVIDIA GPU, no driver, or a machine where this shells out to nothing.
 ///
 /// Deliberately shells out to `nvidia-smi` rather than taking an NVML crate:
-/// the binary ships with the driver, and the one number wanted here doesn't
-/// justify a dependency that would still only cover one vendor.
-///
-/// This reports *capacity*, never a prediction. Disk size doesn't predict a
-/// model's VRAM footprint — measured on this machine it ranges from 0.35× to
-/// 1.21× — so anything that multiplied a `/api/tags` size by a guess would
-/// steer users away from models that fit fine.
-#[tauri::command]
-fn gpu_total_vram_gb() -> Option<f64> {
+/// the binary ships with the driver, and the two numbers wanted here don't
+/// justify a dependency that would still only cover one vendor. The cost is a
+/// process spawn, ~80ms measured on this machine — cheap once, not free on a
+/// timer, which is what decides where each caller below runs.
+fn nvidia_smi_query(field: &str) -> Option<f64> {
     let mut cmd = Command::new("nvidia-smi");
-    cmd.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"]);
+    cmd.arg(format!("--query-gpu={}", field));
+    cmd.arg("--format=csv,noheader,nounits");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -132,8 +129,38 @@ fn gpu_total_vram_gb() -> Option<f64> {
         return None;
     }
     // One line per GPU; the first is the one Ollama will use.
-    let mib: f64 = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()?;
-    Some(mib * 1024.0 * 1024.0 / 1e9)
+    String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()
+}
+
+/// Total VRAM in GB, or `None` when we can't tell.
+///
+/// This reports *capacity*, never a prediction. Disk size doesn't predict a
+/// model's VRAM footprint — measured on this machine it ranges from 0.35× to
+/// 1.21× — so anything that multiplied a `/api/tags` size by a guess would
+/// steer users away from models that fit fine.
+///
+/// Sync because it's fetched once at startup; the spawn doesn't get a chance
+/// to be felt on the main thread.
+#[tauri::command]
+fn gpu_total_vram_gb() -> Option<f64> {
+    Some(nvidia_smi_query("memory.total")? * 1024.0 * 1024.0 / 1e9)
+}
+
+/// Current GPU utilisation as a percentage, or `None` when we can't tell.
+///
+/// A different question from the VRAM residency badge: that one says whether
+/// the model *fits*, this says whether the card is actually *working*. Both
+/// read 100% and 0% for unrelated reasons.
+///
+/// Off the main thread, unlike the capacity query above: this one is polled on
+/// a timer while a turn runs, and 80ms of blocking a second would be visible
+/// as jerk in the same UI it's reporting into.
+#[tauri::command]
+async fn gpu_utilization_pct() -> Option<f64> {
+    tauri::async_runtime::spawn_blocking(|| nvidia_smi_query("utilization.gpu"))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// POST an Ollama endpoint that streams, forwarding each newline-delimited JSON
@@ -1568,6 +1595,7 @@ pub fn run() {
             ollama_ps,
             ollama_unload,
             gpu_total_vram_gb,
+            gpu_utilization_pct,
             ollama_chat,
             ollama_cancel,
             ollama_pull,

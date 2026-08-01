@@ -54,10 +54,10 @@ same 16 GB. That makes build plan §6's "be honest when a model won't fit" the
 opposite of hypothetical: this exact cliff is what produced a wrong finding
 and sent the project chasing small models for the wrong reason.
 
-### P1 — Shell + editor ([hearth-app/](hearth-app)) — Milestone A
+### P1 — Shell + editor ([src/](src) + [src-tauri/](src-tauri)) — Milestone A
 
 Tauri v2 + React + TypeScript + Vite + Tailwind, running locally
-(`npm run tauri dev` from `hearth-app/`):
+(`pnpm run tauri dev` from the repo root):
 
 - Native folder picker (`tauri-plugin-dialog`) → lazy-loaded file tree
   (Rust `list_dir` command, skips `node_modules`/`.git`/`target`/`dist`)
@@ -65,7 +65,7 @@ Tauri v2 + React + TypeScript + Vite + Tailwind, running locally
   language workers wired via Vite `?worker` imports
 - Multi-tab editing with dirty-state tracking (`●` vs `×` on each tab)
 - Ctrl+S save (Rust `read_text_file` / `write_text_file` commands)
-- Zustand store (`hearth-app/src/lib/store.ts`) holding project root, tree
+- Zustand store (`src/lib/store.ts`) holding project root, tree
   cache, open tabs
 
 **Not yet in P1** (deferred to later Milestone-D phases per the plan, cheap
@@ -100,8 +100,8 @@ Design notes worth keeping:
   app. `ollama_chat` streams NDJSON over a `tauri::ipc::Channel`.
 - **The search/replace contract is the one P0 validated** — exact match, then
   whitespace-normalised, then fail loudly, all-or-nothing per file. Ported to
-  [`hearth-app/src/lib/edit.ts`](hearth-app/src/lib/edit.ts), kept import-free
-  so it's unit-tested directly (`cd hearth-app && npm test`).
+  [`src/lib/edit.ts`](src/lib/edit.ts), kept import-free
+  so it's unit-tested directly (`pnpm test`).
 - **The agent refuses to write a file with unsaved editor changes**, and says
   so to the model, rather than silently overwriting the user's work.
 
@@ -174,7 +174,7 @@ whether it worked. **Preview** button, `Run`, and the page appears in-app.
 - **Readiness is the `Local: http://…:PORT/` line, not process liveness.**
   Vite spends its first seconds optimising deps, and prints `ready in 431 ms`
   before it serves anything. The parsing rules live in
-  [`runlog.ts`](hearth-app/src/lib/runlog.ts), import-free and unit-tested —
+  [`runlog.ts`](src/lib/runlog.ts), import-free and unit-tested —
   including the case that matters most, `--strictPort`'s "Port 5399 is already
   in use", which names the right number while meaning the opposite.
 - **Teardown kills the tree.** `npm run dev` on Windows is a cmd → cmd → npm →
@@ -216,7 +216,7 @@ it after editing and fix what comes back.
   string, and a model that can't tell them apart reports a broken build as
   fixed — so the status line is always present and names which it is.
 
-Parsing lives in [`runlog.ts`](hearth-app/src/lib/runlog.ts) with the rest of
+Parsing lives in [`runlog.ts`](src/lib/runlog.ts) with the rest of
 the log rules, import-free and unit-tested.
 
 Still the human's job: *starting* the server. `get_errors` says "ask the user
@@ -246,7 +246,7 @@ multi-step tool instructions, which makes the ~2.4s-per-call speed that made
 it attractive irrelevant.
 
 The probe lives at [`p0-spike/src/tool-probe.ts`](p0-spike/src/tool-probe.ts)
-(`npm run probe -- <model>`). It imports the app's real `TOOL_DEFS`,
+(`pnpm run probe -- <model>`). It imports the app's real `TOOL_DEFS`,
 `systemPrompt`, `applyEdits` and `devLogTail` rather than copies, so it can't
 drift out of step with what ships — `systemPrompt` is exported for that reason.
 It's narrower than the spike next door: that one asks whether a model can hold
@@ -318,9 +318,9 @@ That last part was the same bug through a second door: `MAX_READ_CHARS` (40k)
 alone overflows a 4k or 8k window, so the new control would have been decorative
 at exactly the settings where it matters most. One read is now capped at half
 the window. Both numbers come from `contextLimits(numCtx)` in
-[`session.ts`](hearth-app/src/lib/session.ts), which is import-free and
+[`session.ts`](src/lib/session.ts), which is import-free and
 unit-tested — the sizing is the part that breaks silently if someone raises a
-constant, so it lives where `npm test` can reach it.
+constant, so it lives where `pnpm test` can reach it.
 
 ### Total VRAM, and the fit predictor that shouldn't be built
 
@@ -366,7 +366,7 @@ new model is selected when it lands. Closes P5.
 
 - **Progress is summed across layers.** Ollama reports `completed`/`total` per
   layer, so a percent read off the newest chunk snaps back to 0% every time a
-  layer starts. [`pull.ts`](hearth-app/src/lib/pull.ts) keys totals by digest
+  layer starts. [`pull.ts`](src/lib/pull.ts) keys totals by digest
   and sums — import-free and unit-tested, like the other parsing modules. It
   can still appear to move backwards early on, because layers are announced as
   they begin rather than up front; that's what `ollama pull` does on the
@@ -391,7 +391,7 @@ renders as a scrollable monospace block with a copy button, and inline
 - **Not a markdown parser, on purpose.** A coding model emits prose, fenced
   code and inline code; tables and nested lists are rare enough that pulling in
   remark/unified to cover them would cost more than it returns for an
-  offline-first app. [`markdown.ts`](hearth-app/src/lib/markdown.ts) is a fence
+  offline-first app. [`markdown.ts`](src/lib/markdown.ts) is a fence
   splitter — import-free and unit-tested like the other parsing modules. Reach
   for a real parser when something reads worse for its absence.
 - **The streaming case is the normal case, not the edge case.** Tokens arrive
@@ -512,7 +512,7 @@ mid-query. Flagged in the plan as "cheap to build, disproportionate UX payoff"
 and in decision 4 below as worth pulling forward before P2 — it landed a phase
 late, which is the cost of that decision never being taken.
 
-- **Scoring is ~30 lines in [`fuzzy.ts`](hearth-app/src/lib/fuzzy.ts), not
+- **Scoring is ~30 lines in [`fuzzy.ts`](src/lib/fuzzy.ts), not
   fuse.js.** Everything anyone wants from quick-open is "letters in order,
   prefer word starts, prefer the filename over the directories above it" —
   which is small enough to own, and owning it is what made the next point
@@ -543,7 +543,7 @@ the same tool.
   origin (`localhost:PORT` vs `tauri.localhost`), so Hearth can't reach into
   the document — the bridge has to arrive with the page. It lives in the
   template's `index.html` (`CONSOLE_BRIDGE` in
-  [`workspace.ts`](hearth-app/src/lib/workspace.ts)), patching
+  [`workspace.ts`](src/lib/workspace.ts)), patching
   `console.error`/`warn` and listening for `error` and `unhandledrejection`.
 - **Only scaffolded projects have it.** A folder opened from outside Hearth
   never posts, and `consoleTail` says "not connected" rather than "no errors" —
@@ -564,7 +564,7 @@ the same tool.
   error produces a blank page *and* a silent dev-server log, so with the log
   drawer collapsed there was otherwise nothing at all to notice.
 
-Parsing and the tail format live in [`runlog.ts`](hearth-app/src/lib/runlog.ts)
+Parsing and the tail format live in [`runlog.ts`](src/lib/runlog.ts)
 with the dev-log rules, import-free and unit-tested.
 
 **Verified in a real browser**, not just in unit tests: the template scaffolded
@@ -582,7 +582,7 @@ cosmetic noise in front of a message that still reads correctly, and not worth a
 format-string implementation.
 
 **The system prompt changed**, so the P10 probe result above is stale until
-`npm run probe` is re-run — it now tells the model `get_errors` covers the
+`pnpm run probe` is re-run — it now tells the model `get_errors` covers the
 browser too.
 
 **One bug fell out of it.** llama3.1:8b sends `edits` as a bare
@@ -634,7 +634,7 @@ the diff" is `git show`, "put it back" is `git reset --hard`.
   failed commit costs the review, not the turn that produced the changes.
 
 The Rust `git` command has no allowlist, unlike `run_command`: its args come
-from [`git.ts`](hearth-app/src/lib/git.ts) and never from the model, and the
+from [`git.ts`](src/lib/git.ts) and never from the model, and the
 write verbs `check_command` exists to refuse are the entire point. They arrive
 as a list, so there's no shell to escape. `stdout` and `stderr` come back
 separately — `run_command` merges them, but this one carries file content, and a
@@ -644,7 +644,7 @@ merged stream would splice git's warnings into the middle of a file.
 checkpoints`): init → baseline → a turn's commit → name-status → both sides of
 one file → rollback, including that `node_modules` survives the rollback and
 that a turn changing nothing produces no card. Rename parsing is tested
-separately in [`gitdiff.ts`](hearth-app/src/lib/gitdiff.ts) — `R100→old→new` is
+separately in [`gitdiff.ts`](src/lib/gitdiff.ts) — `R100→old→new` is
 three tab-separated fields, and taking the second gives a path that doesn't
 exist at that commit, so every lookup would come back empty and the diff would
 read as a whole-file deletion.
@@ -744,9 +744,9 @@ unchecked project as a fixed one: no server, no config, nothing checked yet, and
 actually clean.
 
 Parsing and the agent's view live in
-[`problems.ts`](hearth-app/src/lib/problems.ts), import-free and unit-tested like
-the other parsing modules; the client is [`lsp.ts`](hearth-app/src/lib/lsp.ts)
-and the editor wiring [`monaco-ts.ts`](hearth-app/src/lib/monaco-ts.ts).
+[`problems.ts`](src/lib/problems.ts), import-free and unit-tested like
+the other parsing modules; the client is [`lsp.ts`](src/lib/lsp.ts)
+and the editor wiring [`monaco-ts.ts`](src/lib/monaco-ts.ts).
 
 **That split is load-bearing, not tidiness.** Monaco dies on
 `window is not defined` under plain node, and the P10 probe imports `agent.ts`
@@ -1147,7 +1147,7 @@ file per project cannot.
 
 - **The schema is `CREATE TABLE IF NOT EXISTS` run from the frontend on every
   open, not a Rust migration list.** The point is testability: the statements
-  live in [`chatsql.ts`](hearth-app/src/lib/chatsql.ts) and `npm test` executes
+  live in [`chatsql.ts`](src/lib/chatsql.ts) and `pnpm test` executes
   *those exact strings* against a real SQLite through Node 24's `node:sqlite`.
   A migration the tests can't reach is a schema nobody checks until the app
   won't start. (Marked `ponytail:` — the day a column changes, this needs real
@@ -1181,7 +1181,7 @@ file per project cannot.
   after an upgrade would be sent a conversation the model has never seen. The
   JSONL files are left on disk rather than deleted — removing someone's only
   copy of a conversation to tidy up isn't a trade worth making — so
-  [`transcript.ts`](hearth-app/src/lib/transcript.ts) survives as the importer's
+  [`transcript.ts`](src/lib/transcript.ts) survives as the importer's
   parser, minus the writer.
 
 ### The split editor — P1's last deferral
@@ -1240,7 +1240,7 @@ The turn is now written down as it goes, and the panel offers it back.
   unfinished turn gets verified or just ends, and the writes it describes
   happened in a process that no longer exists. Counted from the last user message
   on, so an earlier turn's edits don't put a project-wide type check in front of
-  a conversational reply. It lives in [`session.ts`](hearth-app/src/lib/session.ts)
+  a conversational reply. It lives in [`session.ts`](src/lib/session.ts)
   as `wroteThisTurn`, import-free and unit-tested, including the PLAN case where
   the last user message is the plan's acknowledgement rather than the prompt.
 - A resume is itself resumable: the messages it starts from are written back as
@@ -1288,6 +1288,81 @@ transform, because the tip moves between frames and the base doesn't, which is
 what makes it read as a fire rather than a wobbling icon. No image file, nothing
 to decode, nothing to load. `prefers-reduced-motion` gets one lit frame, and the
 seconds keep counting either way.
+
+### The 20 tasks, through the app's loop — and what the number was worth
+
+The spike scores a model with P0's five tools: no `get_errors`, no type check,
+no auto-repair round. gemma4's 12/20 there is recorded above with the note that
+four of the eight failures wrote syntactically broken TypeScript — "exactly what
+P9 and P10 were built to catch", and that running the same tasks through the
+app's loop was "the obvious next measurement". It's built
+([`loop-spike.ts`](p0-spike/src/loop-spike.ts)) and it was run, and the first
+thing it establishes is that **the 12/20 was one sample of a very wide
+distribution**, so most of what was written above it doesn't hold.
+
+Five bare runs and five app-loop runs, same fixture, same 20 tasks, same
+verify, same machine, same afternoon:
+
+| loop | runs | pass/20 each | mean | iterations | wall/task |
+|---|---|---|---|---|---|
+| bare (P0's five tools) | 5 | 12, 13, 14, **8**, 12 | 11.8 | 3.8 | 9.3s |
+| app (PLAN on) | 4 | 10, 8, 10, 9 | 9.3 | 6.3 | 20.2s |
+| app (PLAN off) | 1 | 12 | 12.0 | 6.0 | 15.7s |
+
+**The bare loop's own range is 8–14.** That's 40%–70% from one configuration,
+and it swallows every difference between configurations. Across all ten runs
+only two of the twenty tasks came out the same way every time. The honest
+reading is not
+"the app's loop scores 9.3 against 11.8" — it's that a 20-task run of this
+harness cannot resolve a two-or-three-task difference, and the recorded 60%
+should never have been quoted as a property of the model.
+
+What *is* outside the noise, at 100 task-runs per side:
+
+- **The net doesn't reduce broken output. 24 of 100 app-loop runs ended with a
+  file too broken to parse, against 22 of 100 bare.** This is the headline, and
+  it's the opposite of what the phase predicted. The failure is nearly always
+  the model emitting `\n` as a backslash and an `n`, or dropping a brace.
+- **It isn't blindness — the model looks, and can't act.** 87 of 100 runs called
+  `get_errors`, and it reported the damage plainly: 22 type errors on one run,
+  46 on another. gemma4 reads that and mostly re-asserts that it has finished.
+- **The extra rounds are where the damage comes from.** In the app's loop a
+  passing run averages 4.9 iterations and a failing one 7.5; in the bare loop
+  the two are 3.8 and 3.9. Length doesn't predict failure without the net, and
+  does with it. A bounced `finish` buys another edit, and another edit on a file
+  a small model is already mangling is another chance to mangle it.
+
+So P9 and P10 are worth what they are worth *to a human* — the squiggle, the
+Problems panel, the report a person can read — and, on this model, close to
+nothing as an autonomous repair loop. That isn't an argument for removing them;
+the same three sources are what the human error loop reads, and a stronger model
+is the variable this measures, not the tooling. It is an argument against the
+sentence above that assumed 60% was the model held back by a missing safety net.
+
+**One thing was straightforwardly broken, and is fixed.** 25 of the 38 repair
+rounds spent across those runs got no edit at all before the next `finish` — the
+model answers a bounce by claiming again that it's done. Each of those cost a
+full model call for an answer that could not have changed: the verdict is read
+back off the project, so with no write in between the second check reads the
+same files and returns the same result. That's `stalled`'s rule with a different
+tool name, and it's now `worthRepairing` in
+[`session.ts`](src/lib/session.ts) — the first bounce is free, later
+ones need a write since the last. Import-free and unit-tested, and applied in
+the harness as well as the app so the two loops can't drift.
+
+That sharing is the other half of the work. There were two copies of the app's
+loop outside the app (the probe's and this one's would have been the third and
+fourth), and the probe had already been caught twice measuring a loop the app no
+longer ran. The loop now lives once, in
+[`app-loop.ts`](p0-spike/src/app-loop.ts), importing the system prompt, tool
+definitions, PLAN step, history packing, loop detection and finish verification
+from the app's `src/lib`. What a caller supplies is the world: the probe's is
+canned so
+its runs stay deterministic, and the loop spike's is real files with a real
+whole-program type check through the TypeScript compiler API. It aborts if the
+untouched fixture doesn't type-check clean — otherwise every task is handed
+errors the model didn't cause and burns its repair rounds chasing them, and
+nothing would say so.
 
 ---
 
@@ -1395,10 +1470,13 @@ decisions rather than backlog.
   only Milestone-A gap left. A Next or webpack project runs and previews; it
   just has no console capture, which `consoleTail` reports rather than passing
   off as silence.
-- **The spike measures the model without the app around it.** Its tool set is
-  P0's five, so the four broken-syntax failures in the 20-task run are ones the
-  app's type check and auto-repair would catch. Scoring the same tasks through
-  the real loop is the measurement that would say how much those are worth.
+- **~~The spike measures the model without the app around it.~~** Measured —
+  `pnpm run loop-spike` runs the same 20 tasks through the app's loop, and the
+  answer is that the type check and auto-repair round *don't* catch the
+  broken-syntax failures (24 of 100 against the bare loop's 22). See above. What
+  the measurement mostly established is that this harness needs several runs per
+  configuration before a number from it means anything: the bare loop alone
+  scores anywhere from 8/20 to 14/20.
 
 ---
 
@@ -1453,14 +1531,20 @@ they don't get silently decided by momentum.
    two scenarios rather than one. What isn't measured is whether devstral
    holds a loop in the scaffold it was trained for — this scores it in
    Hearth's, which is the question Hearth has.
-2. **~~Widen the P0 task set.~~** Done: 20 tasks, and `npm run check-tasks`
+2. **~~Widen the P0 task set.~~** Done: 20 tasks, and `pnpm run check-tasks`
    asserts every one of them fails on an untouched fixture — a verify that
    passes without the model having done anything scores every model as
    correct, and the table is the whole output of the spike.
 
-   **gemma4 scores 12/20 (60%)**, 0 malformed JSON, 0 wrong-tool calls, 2
-   failed diffs, 3.6 iterations and 7.9s per task. The interesting half is the
-   8 failures, which split evenly:
+   **gemma4 scored 12/20 (60%)** on the run this was written from, 0 malformed
+   JSON, 0 wrong-tool calls, 2 failed diffs, 3.6 iterations and 7.9s per task.
+
+   **That 60% is one sample, and the spread is 8/20 to 14/20** — five runs of
+   this exact configuration, measured later the same day. Everything below is
+   still a fair description of *that run's* failures; none of it is a rate. See
+   "The 20 tasks, through the app's loop" above.
+
+   The interesting half is the 8 failures, which split evenly:
 
    - **4 wrote syntactically broken TypeScript** — a stray `}`, a `return` at
      top level, a mangled newline. Not a diff that failed to apply: the edit
@@ -1470,10 +1554,13 @@ they don't get silently decided by momentum.
 
    The first group is the one to read carefully, because **the spike has no
    safety net**: its tool set is P0's five, so there's no `get_errors`, no type
-   check and no auto-repair round. Those four are exactly what P9 and P10 were
-   built to catch, and the app has both. 60% is the model without the app.
-   Running the same tasks through the app's loop is the obvious next
-   measurement, and it's a bigger harness than this one.
+   check and no auto-repair round. Those four looked like exactly what P9 and
+   P10 were built to catch.
+
+   **They aren't.** `pnpm run loop-spike` runs these same tasks through the app's
+   loop, and broken-parse endings come out at 24 of 100 against 22 of 100 —
+   unchanged. The model calls `get_errors`, is told about the damage, and
+   re-asserts that it has finished. Written up above.
 
    The app's own `applyEdits` was checked directly against this, since a
    corrupting edit path would look identical from here: handed a real
@@ -1524,20 +1611,30 @@ they don't get silently decided by momentum.
 # Score a model on the two loops that matter: does it check its own work after
 # editing (heading), and does it find a file nobody named (unfamiliar). Both
 # scenarios per model unless --scenario narrows it. ~30s for a model that fits.
-cd p0-spike && npm run probe -- gemma4:latest devstral:24b
+cd p0-spike && pnpm run probe -- gemma4:latest devstral:24b
 ```
 
 ```bash
 # The wider P0 spike — 20 tasks, pass/fail on actually running the result.
 # Scores correctness, not instruction-following, and without get_errors or a
 # type check in front of it. ~3 minutes for gemma4.
-cd p0-spike && npm run spike -- gemma4:latest
+#
+# One run is not a score: this configuration ranges 8/20 to 14/20 on gemma4.
+# Run it several times before comparing anything to anything.
+cd p0-spike && pnpm run spike -- gemma4:latest
+```
+
+```bash
+# The same 20 tasks through the app's loop — real get_errors with a real
+# whole-program type check, PLAN, auto-repair rounds, loop detection. What the
+# safety net is worth, against the line above. ~6 minutes for gemma4.
+cd p0-spike && pnpm run loop-spike -- gemma4:latest        # --no-plan drops PLAN
 ```
 
 ```bash
 # Run after touching tasks.ts or the fixture: every task must fail on an
 # untouched fixture, or the spike scores every model as correct.
-cd p0-spike && npm run check-tasks
+cd p0-spike && pnpm run check-tasks
 ```
 
 ```bash
@@ -1549,17 +1646,18 @@ ollama ps
 
 ```bash
 # Run the app
-cd hearth-app && npm run tauri dev
+pnpm run tauri dev
 ```
 
 ```bash
-# Unit tests (114): path safety, search/replace, session packing, context
-# sizing, interrupted-turn recovery, run-state machine, dev-log and
+# Unit tests (115): path safety, search/replace, session packing, context
+# sizing, repair-round budgeting, interrupted-turn recovery, run-state machine,
+# dev-log and
 # missing-package parsing, pull progress, fenced-code splitting, checkpoint
 # name-status, hunk parsing, repo-map extraction, .env redaction, diagnostic
 # folding, transcript framing — plus the chat store's SQL against a real
 # SQLite, and one that drives a real tsserver
-cd hearth-app && npm test
+pnpm test
 ```
 
 ```bash
@@ -1567,12 +1665,12 @@ cd hearth-app && npm test
 # detection, project search, the command allowlist, a real shell in a real PTY,
 # a real tsserver reporting a real type error, and the whole checkpoint sequence
 # against a real git repo
-cd hearth-app/src-tauri && cargo test --no-default-features
+cd src-tauri && cargo test --no-default-features
 ```
 
 ```bash
 # Package it. Worth running after touching bundle.resources — type checking in
 # an installed build depends on tsserver.js actually landing in there, which
 # only this says.
-cd hearth-app && npm run tauri build
+pnpm run tauri build
 ```

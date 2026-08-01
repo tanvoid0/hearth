@@ -73,6 +73,24 @@ export function stalled(signatures: string[], limit = 3): boolean {
 }
 
 /**
+ * Is another repair round worth a model call?
+ *
+ * `stalled`'s rule, applied to `finish`. The first bounce is the prod P10
+ * exists for. A second one can only mean something if the model changed
+ * something on disk in between — the verdict is read back off the project, so
+ * without a write the second answer is provably the first one. Re-sending it
+ * buys nothing and costs a full call, which on a model that spilled to CPU is
+ * minutes.
+ *
+ * Measured in the loop spike: 15 of 21 repair rounds got no edit at all before
+ * the next `finish`. gemma4's usual answer to a bounce is to re-assert that it
+ * has finished.
+ */
+export function worthRepairing(rounds: number, max: number, wroteSinceLast: boolean): boolean {
+  return rounds < max && (rounds === 0 || wroteSinceLast);
+}
+
+/**
  * Did the current turn already change something on disk?
  *
  * Asked of a resumed turn, whose writes happened in a process that no longer

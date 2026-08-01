@@ -7,6 +7,7 @@ import {
   rebaseTab,
   stalled,
   trimForStorage,
+  worthRepairing,
   wroteThisTurn,
   type Tab,
 } from "./session.ts";
@@ -178,4 +179,17 @@ test("the same call returning the same answer three times is stuck", () => {
   // Two of a kind isn't yet a loop — a retry after an unrelated step is normal.
   assert.equal(stalled(spinning.slice(0, 3)), false);
   assert.equal(stalled([]), false);
+});
+
+test("a repair round is only worth repeating if the model actually changed something", () => {
+  // The first bounce is the prod, and it's free of any precondition.
+  assert.equal(worthRepairing(0, 3, false), true);
+  // It edited after being told, so the verdict can genuinely differ. Bounce on.
+  assert.equal(worthRepairing(1, 3, true), true);
+  // It re-asserted `finish` with nothing written in between. The verdict is
+  // read off the project, so a second check reads the same files and returns
+  // the same answer — measured as gemma4's usual response to a bounce.
+  assert.equal(worthRepairing(1, 3, false), false);
+  // And the cap still binds when it has been editing all along.
+  assert.equal(worthRepairing(3, 3, true), false);
 });

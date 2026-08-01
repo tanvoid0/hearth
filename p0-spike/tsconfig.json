@@ -7,7 +7,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    // tool-probe.ts reaches into hearth-app/src/lib by relative path so it
+    // tool-probe.ts reaches into src/lib by relative path so it
     // runs the app's real tool definitions rather than a copy. tsx executes
     // this package directly — nothing here is ever compiled to JS.
     "allowImportingTsExtensions": true,

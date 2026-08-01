@@ -5,28 +5,30 @@ running against models on your own machine. See the
 [build plan](Hearth%20build%20plan.md) for the what and why, and
 [PROGRESS.md](PROGRESS.md) for where the work currently stands.
 
-Two things live here today:
+The app lives at the repo root — a Tauri + React desktop app with a file tree,
+Monaco tabs, terminal, dev server, preview, type checking, and an agent that
+edits the open project ([`src/`](src) is the frontend, [`src-tauri/`](src-tauri)
+the Rust side). P0–P14 have landed.
 
-| | what it is | status |
-|---|---|---|
-| [`hearth-app/`](hearth-app) | the Tauri + React desktop app — file tree, Monaco tabs, terminal, dev server, preview, type checking, and an agent that edits the open project | P0–P14 landed |
-| [`p0-spike/`](p0-spike) | headless harness that scores a local model on a multi-step tool loop | P0 done |
+Alongside it, [`p0-spike/`](p0-spike) is a headless harness that scores a local
+model on a multi-step tool loop, importing the app's own agent code from
+`src/lib` so it can't drift out of step. P0 done.
 
 ## Prerequisites
 
-- **Node.js 20+** and npm
+- **Node.js 20+** and [pnpm](https://pnpm.io) (`corepack enable pnpm`)
 - **Rust** (stable) — [rustup.rs](https://rustup.rs)
 - **Tauri v2 system deps** — on Windows that's the WebView2 runtime (ships
   with Windows 11) and the MSVC build tools; on Linux/macOS see
   [Tauri's prerequisites](https://tauri.app/start/prerequisites/)
 - **[Ollama](https://ollama.com)** — running, with at least one tool-capable
-  model pulled (`ollama pull llama3.1:8b`). Needed by both the app's agent
+  model pulled (`ollama pull gemma4`). Needed by both the app's agent
   panel and `p0-spike`.
 
 ## Run the app
 
 ```bash
-cd hearth-app && npm install && npm run tauri dev
+pnpm install && pnpm run tauri dev
 ```
 
 First run compiles the Rust side and takes a few minutes; later runs are
@@ -57,8 +59,11 @@ that fits runs on the GPU and answers in seconds, while one that doesn't falls
 back to CPU and takes minutes per step — and a 12-step task pays that twelve
 times. `ollama ps` reports the split (`100% GPU` vs a CPU share), which is
 worth checking before blaming a model for being slow. Models that can't call
-tools (base models, most Gemma builds) fail with an Ollama error rather than
-misbehave quietly.
+tools (anything tagged `-base`, embedding models) fail with an Ollama error
+rather than misbehave quietly. Fitting is necessary and not sufficient: of the
+models measured here, `gemma4` holds a multi-step tool loop and `llama3.1:8b`
+and `devstral:24b` abandon the turn instead of finishing it — the tables in
+[PROGRESS.md](PROGRESS.md) are the record.
 
 The agent checks its own work rather than waiting to be told what broke.
 `get_errors` hands it type errors from the TypeScript compiler, the dev
@@ -83,7 +88,7 @@ about where a reply ends up — the transcript is stored and replayed as history
 on every later turn.
 
 ```bash
-cd hearth-app && npm test
+pnpm test
 ```
 
 runs the unit tests — path safety, search/replace, context sizing, log and
@@ -94,26 +99,33 @@ framing layers against real shells, repos and servers.
 To produce an installer instead:
 
 ```bash
-cd hearth-app && npm run tauri build
+pnpm run tauri build
 ```
 
 ## Run the P0 spike
 
 Needs Ollama running with at least one tool-capable model pulled. It scores
-each model on 8 real tasks against a throwaway copy of a toy repo — it applies
+each model on 20 real tasks against a throwaway copy of a toy repo — it applies
 the model's edits and then executes the result, so a pass means the code
 actually works.
 
 ```bash
-cd p0-spike && npm install && npm run spike
+cd p0-spike && pnpm install && pnpm run spike
 ```
 
-Defaults to `qwen3-coder:30b,llama3.1:8b`. Override with a comma-separated
-list:
+Defaults to `gemma4:latest`. Override with a comma-separated list:
 
 ```bash
-npm run spike -- "qwen3-coder:30b"
+pnpm run spike -- "gemma4:latest,devstral:24b"
 ```
+
+One run is not a score — this configuration ranges 8/20 to 14/20 on the same
+model. Run it several times before comparing anything to anything.
+
+`pnpm run loop-spike` runs the same 20 tasks through the *app's* loop instead —
+real `get_errors`, a whole-program type check, PLAN and auto-repair rounds —
+which is what says whether the safety net is worth anything. `pnpm run probe`
+is the narrow, ~30s version that only asks whether a model checks its own work.
 
 Models must already be pulled (`ollama pull <model>`) — the spike checks
 before it starts and tells you what's missing. See

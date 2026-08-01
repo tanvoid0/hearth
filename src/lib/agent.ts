@@ -3,7 +3,7 @@ import { exportedSymbols, formatRepoMap, isSourceFile } from "./repomap";
 import { isSecretFile, redactEnv } from "./secrets";
 import { applyEdits, changedLines, resolveInProject, samePath, type Edit } from "./edit";
 import { CANCELLED, chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
-import { contextLimits, packHistory, stalled, wroteThisTurn } from "./session";
+import { contextLimits, packHistory, stalled, worthRepairing, wroteThisTurn } from "./session";
 import { useHearthStore } from "./store";
 import { useRunner } from "./runner";
 import { consoleTail, countErrorsSince, devLogTail } from "./runlog";
@@ -435,12 +435,12 @@ function preview(name: string, args: any): string {
  * every time the context window trims. Costs one extra call per turn, which is
  * why it's a switch rather than a law.
  */
-const PLAN_PROMPT =
+export const PLAN_PROMPT =
   "Before touching anything, write a short numbered plan for this task: which files you expect to " +
   "read or change, what the change is, and what you will check afterwards. At most five steps. " +
   "Do not call any tools yet and do not write out the code — just the plan.";
 
-const PLAN_ACK = "Now carry that out with the tools, adjusting the plan if what you read contradicts it.";
+export const PLAN_ACK = "Now carry that out with the tools, adjusting the plan if what you read contradicts it.";
 
 export function systemPrompt(root: string, activeFile?: string | null): string {
   return [
@@ -482,6 +482,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
   if (!resuming) messages.push({ role: "user", content: prompt });
 
   let repairs = 0;
+  /** Reset on every bounce. See `worthRepairing`: a finish that follows one
+   *  without a single write in between is the same claim over the same files,
+   *  so re-verifying it can only produce the same answer. */
+  let wroteSinceRepair = false;
   /** Whether this turn changed anything on disk — what makes an unfinished
    *  turn worth verifying rather than just ending. Recovered from the messages
    *  when resuming: those writes happened, even though this process didn't make
@@ -583,8 +587,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
           // the failure mode the probe measures, and the one thing that turns
           // this from a chat window into something that finishes a job.
           const verdict = await verify(root, maxRead);
-          if (verdict.blocking > 0 && repairs < MAX_REPAIR_ROUNDS) {
+          if (verdict.blocking > 0 && worthRepairing(repairs, MAX_REPAIR_ROUNDS, wroteSinceRepair)) {
             repairs++;
+            wroteSinceRepair = false;
             messages.push({
               role: "tool",
               tool_name: name,
@@ -630,6 +635,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
         // logged before this write describe the code the agent just replaced.
         if (result.ok && (name === "edit_file" || name === "write_file")) {
           wrote = true;
+          wroteSinceRepair = true;
           useRunner.getState().markConsole();
         }
         messages.push({ role: "tool", tool_name: name, content: result.output });

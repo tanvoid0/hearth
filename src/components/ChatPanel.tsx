@@ -11,6 +11,7 @@ import {
   cancelChat,
   CTX_KEY,
   DEFAULT_NUM_CTX,
+  gpuUtilizationPct,
   listModels,
   loadedModel,
   MODEL_KEY,
@@ -23,9 +24,15 @@ import {
 
 const PLAN_KEY = "hearth.plan";
 const ASK_KEY = "hearth.ask";
-/** Only while a turn is in flight — that's when the split is worth knowing and
- *  the only time it changes on its own. */
+/** A localhost read of `/api/ps`, so it runs whether or not a turn is in
+ *  flight: the split changes when a turn loads a model, and also when an idle
+ *  one unloads itself with nothing running. */
 const LOAD_POLL_MS = 5000;
+
+/** Faster than the split, because this is the number that actually moves
+ *  second to second. Floor, not a target — see the poll for the spawn cost
+ *  that sets it. */
+const GPU_POLL_MS = 1000;
 
 /** Discrete steps rather than a slider: the KV cache scales with this, and the
  *  values between powers of two buy nothing worth a drag gesture. No per-model
@@ -82,7 +89,10 @@ function LoadBadge({
             : "bg-amber-950 text-amber-400"
       }`}
     >
-      {load.gpuPercent}% GPU{stale ? ` at ${load.contextLength / 1024}k` : ""}
+      {/* "in VRAM", not "GPU": this is how much of the model is resident, not
+          how hard the GPU is working. Labelled "% GPU" it read as a utilisation
+          meter that was stuck at 100. */}
+      {load.gpuPercent}% in VRAM{stale ? ` at ${load.contextLength / 1024}k` : ""}
     </button>
   );
 }
@@ -239,6 +249,7 @@ export function ChatPanel() {
   const setInput = useHearthStore((s) => s.setComposer);
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [gpuBusy, setGpuBusy] = useState<number | null>(null);
   const [load, setLoad] = useState<LoadedModel | null>(null);
   // Fixed for the life of the process — fetched once, not polled with the split.
   const [totalVram, setTotalVram] = useState<number | null>(null);
@@ -348,9 +359,32 @@ export function ChatPanel() {
     return () => clearInterval(id);
   }, [running]);
 
+  // How hard the card is working, beside how long the turn has taken — the
+  // answer to a question the VRAM badge doesn't ask and gets misread as
+  // answering.
+  //
+  // Only while a turn runs, and no faster than a second: each sample spawns
+  // nvidia-smi (~80ms), which is noise beside a model that's saturating the
+  // GPU anyway and pure waste with nothing to watch. Cleared on the way out,
+  // so a finished turn doesn't leave its last reading on screen looking live.
+  useEffect(() => {
+    if (!running) return setGpuBusy(null);
+    let alive = true;
+    const sample = () => gpuUtilizationPct().then((v) => alive && setGpuBusy(v));
+    void sample();
+    const id = setInterval(sample, GPU_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [running]);
+
   // Ollama only reports a split for a model that's actually loaded, and loading
   // happens on the first call — so this has to keep looking during a turn, not
-  // once before it. Idle models unload themselves, hence the re-check on switch.
+  // once before it. It keeps looking between turns too: a model unloads itself
+  // after a few idle minutes, and polling only while running left the badge
+  // claiming a model was resident long after Ollama had dropped it. `/api/ps`
+  // is a read — it doesn't touch the keep-alive timer it's reporting on.
   useEffect(() => {
     if (!model) return setLoad(null);
     let alive = true;
@@ -360,13 +394,12 @@ export function ChatPanel() {
         () => alive && setLoad(null)
       );
     void check();
-    if (!running) return () => void (alive = false);
     const id = setInterval(check, LOAD_POLL_MS);
     return () => {
       alive = false;
       clearInterval(id);
     };
-  }, [model, running]);
+  }, [model]);
 
   // Conversations are keyed by project root in the store, so switching projects
   // switches transcripts rather than resetting one — only the in-flight token
@@ -623,6 +656,7 @@ export function ChatPanel() {
             <ThinkingFlame />
             <span>
               {streaming ? "writing" : "thinking"}… {elapsed}s
+              {gpuBusy !== null && ` · GPU ${Math.round(gpuBusy)}%`}
             </span>
           </div>
         )}
