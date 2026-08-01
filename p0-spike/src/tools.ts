@@ -1,5 +1,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { applyEdits, type Edit } from "../../hearth-app/src/lib/edit.ts";
+
+export type { Edit };
 
 // Minimal tool set per build-plan §5: list_files, read_file, edit_file,
 // write_file, finish. search/run_command/get_errors are out of scope for P0 —
@@ -62,46 +65,16 @@ export async function readFile(workdir: string, relPath: string): Promise<ToolRe
   }
 }
 
-export interface Edit {
-  search: string;
-  replace: string;
-}
-
-// Aider-style search/replace, per build-plan §5: exact match, then
-// whitespace-normalised match, then fail loudly — never fuzzy-apply.
-function normalizeWhitespace(s: string): string {
-  return s.replace(/[ \t]+/g, " ").replace(/\s+$/gm, "").trim();
-}
-
+// The search/replace contract itself is the app's, imported rather than
+// copied. It was a copy until the two were diffed and found identical, which is
+// the good outcome of a duplicate and not one to rely on twice: this harness
+// exists to score how well a model drives that exact matcher, so a spike
+// grading its own private version would eventually be grading the wrong thing.
 export async function editFile(workdir: string, relPath: string, edits: Edit[]): Promise<ToolResult> {
   try {
     const target = resolveInWorkdir(workdir, relPath);
-    let content = await fs.readFile(target, "utf8");
-    const failures: string[] = [];
-
-    for (const [i, edit] of edits.entries()) {
-      if (content.includes(edit.search)) {
-        content = content.replace(edit.search, edit.replace);
-        continue;
-      }
-      // whitespace-normalised fallback: find a line-run whose normalised form matches
-      const searchNorm = normalizeWhitespace(edit.search);
-      const lines = content.split("\n");
-      const searchLines = edit.search.split("\n").length;
-      let matched = false;
-      for (let start = 0; start <= lines.length - searchLines; start++) {
-        const chunk = lines.slice(start, start + searchLines).join("\n");
-        if (normalizeWhitespace(chunk) === searchNorm) {
-          lines.splice(start, searchLines, edit.replace);
-          content = lines.join("\n");
-          matched = true;
-          break;
-        }
-      }
-      if (!matched) {
-        failures.push(`edit #${i}: SEARCH block not found (exact or whitespace-normalised):\n${edit.search}`);
-      }
-    }
+    const before = await fs.readFile(target, "utf8");
+    const { content, failures } = applyEdits(before, edits);
 
     if (failures.length > 0) {
       return { ok: false, output: `edit_file failed, no changes applied:\n${failures.join("\n\n")}` };
