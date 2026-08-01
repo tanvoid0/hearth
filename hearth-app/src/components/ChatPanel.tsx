@@ -1,0 +1,551 @@
+import { useEffect, useRef, useState } from "react";
+import { useHearthStore } from "../lib/store";
+import { runAgent } from "../lib/agent";
+import { chatFor, useChatStore, type Entry } from "../lib/chat";
+import { pullPercent, type PullState } from "../lib/pull";
+import { changedFiles, commitAll, ensureRepo, fileVersions, restore } from "../lib/git";
+import { changeLabel, type FileChange } from "../lib/gitdiff";
+import { RichText } from "./RichText";
+import {
+  DEFAULT_NUM_CTX,
+  listModels,
+  loadedModel,
+  pullModel,
+  totalVramGb,
+  unloadModel,
+  type LoadedModel,
+  type ModelInfo,
+} from "../lib/ollama";
+
+const MODEL_KEY = "hearth.model";
+const CTX_KEY = "hearth.numCtx";
+/** Only while a turn is in flight — that's when the split is worth knowing and
+ *  the only time it changes on its own. */
+const LOAD_POLL_MS = 5000;
+
+/** Discrete steps rather than a slider: the KV cache scales with this, and the
+ *  values between powers of two buy nothing worth a drag gesture. No per-model
+ *  ceiling is looked up — Ollama clamps to what the model supports, and the
+ *  badge reports what it actually got. */
+const CTX_CHOICES = [4096, 8192, 16384, 32768];
+
+function LoadBadge({
+  load,
+  numCtx,
+  totalVram,
+  onUnload,
+}: {
+  load: LoadedModel;
+  numCtx: number;
+  totalVram: number | null;
+  /** Absent while a turn is in flight — unloading mid-turn kills it. */
+  onUnload?: () => void;
+}) {
+  const onGpu = load.gpuPercent >= 100;
+  // The split belongs to the context the model was loaded with. Change the
+  // setting and this number describes the old one until the next turn reloads
+  // the model — say which, rather than reporting a reassuring stale number.
+  const stale = load.contextLength > 0 && load.contextLength !== numCtx;
+  const onCpuGb = (load.sizeGb * (1 - load.gpuPercent / 100)).toFixed(1);
+  // Both numbers measured. Nothing here estimates what an *unloaded* model
+  // would take: on this machine the disk-size-to-VRAM ratio ranges 0.35×–1.21×
+  // across three models, so a predicted footprint would be worse than none.
+  const headroom =
+    totalVram === null
+      ? ""
+      : ` Using ${(load.sizeGb * (load.gpuPercent / 100)).toFixed(1)}GB of ${totalVram.toFixed(1)}GB VRAM.`;
+  return (
+    <button
+      onClick={onUnload}
+      disabled={!onUnload}
+      title={
+        [
+          onGpu
+            ? `Fully in VRAM at num_ctx ${load.contextLength}.`
+            : `${onCpuGb}GB of ${load.sizeGb.toFixed(1)}GB is on the CPU at num_ctx ${load.contextLength}. Expect minutes per step — a smaller model or a lower context fits.`,
+          stale ? `Set to ${numCtx}; takes effect when the model reloads on the next turn.` : "",
+        ]
+          .filter(Boolean)
+          .join(" ") +
+        headroom +
+        (onUnload ? " Click to unload it and free that VRAM now." : "")
+      }
+      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] enabled:hover:brightness-125 ${
+        stale
+          ? "bg-neutral-800 text-neutral-500"
+          : onGpu
+            ? "bg-emerald-950 text-emerald-400"
+            : "bg-amber-950 text-amber-400"
+      }`}
+    >
+      {load.gpuPercent}% GPU{stale ? ` at ${load.contextLength / 1024}k` : ""}
+    </button>
+  );
+}
+
+function ToolRow({ entry }: { entry: Extract<Entry, { kind: "tool" }> }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="text-[12px]">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left font-mono text-neutral-400 hover:bg-neutral-800"
+      >
+        <span className={entry.ok ? "text-emerald-500" : "text-red-400"}>{entry.ok ? "✓" : "✗"}</span>
+        <span className="truncate">{entry.label}</span>
+      </button>
+      {open && (
+        <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-900 p-2 text-[11px] text-neutral-400">
+          {entry.detail}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+const STATUS_COLOR: Record<string, string> = {
+  A: "text-emerald-500",
+  M: "text-amber-500",
+  D: "text-red-400",
+};
+
+/** One agent turn's commit, in the timeline where the turn happened. The files
+ *  open as diffs; the whole thing rolls back with one button — both are git
+ *  calls against `.hearth/git`, not a snapshot store (plan §7). */
+function CheckpointCard({ entry, root }: { entry: Extract<Entry, { kind: "checkpoint" }>; root: string }) {
+  const [busy, setBusy] = useState(false);
+  const short = entry.sha.slice(0, 7);
+  const report = (text: string) => useChatStore.getState().addEntry(root, { kind: "error", text });
+
+  async function review(file: FileChange) {
+    try {
+      const { before, after } = await fileVersions(root, entry.sha, file.path);
+      useHearthStore.getState().openDiff({
+        path: file.path,
+        label: `checkpoint ${short}`,
+        original: before,
+        modified: after,
+      });
+    } catch (err) {
+      report((err as Error).message);
+    }
+  }
+
+  async function restoreHere() {
+    if (!confirm(`Restore the project to checkpoint ${short}?\n\nEverything changed after it is discarded.`)) return;
+    setBusy(true);
+    try {
+      await restore(root, entry.sha);
+      useHearthStore.getState().closeDiff();
+      await useHearthStore.getState().rehydrateFromDisk();
+      // The conversation still describes files that no longer look like that,
+      // and nothing tells the model the ground moved under it.
+      useChatStore.getState().addEntry(root, {
+        kind: "note",
+        text: `restored to ${short} — start a new chat if the agent works from the files it remembers`,
+      });
+    } catch (err) {
+      report((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="rounded border border-neutral-800 bg-neutral-900/60 text-[12px]">
+      <div className="flex items-center gap-2 border-b border-neutral-800 px-2 py-1">
+        <span className="font-mono text-[11px] text-neutral-500">◈ {short}</span>
+        <span className="text-[11px] text-neutral-500">
+          {entry.files.length} file{entry.files.length === 1 ? "" : "s"}
+        </span>
+        <button
+          onClick={() => void restoreHere()}
+          disabled={busy}
+          title="Reset the project to how it looked right after this turn. Untracked files are left alone."
+          className="ml-auto rounded px-1.5 py-0.5 text-[11px] text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 disabled:opacity-40"
+        >
+          Restore
+        </button>
+      </div>
+      {entry.files.map((f) => (
+        <button
+          key={f.path}
+          onClick={() => void review(f)}
+          className="flex w-full items-center gap-2 px-2 py-1 text-left font-mono text-[11px] hover:bg-neutral-800"
+        >
+          <span className={`w-3 shrink-0 ${STATUS_COLOR[f.status] ?? "text-neutral-500"}`} title={changeLabel(f.status)}>
+            {f.status}
+          </span>
+          <span className="truncate text-neutral-300">{f.path}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function ChatPanel() {
+  const projectRoot = useHearthStore((s) => s.projectRoot);
+  const activePath = useHearthStore((s) => s.activePath);
+  const pendingPrompt = useHearthStore((s) => s.pendingPrompt);
+
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [model, setModel] = useState(() => localStorage.getItem(MODEL_KEY) ?? "");
+  const [numCtx, setNumCtx] = useState(() => Number(localStorage.getItem(CTX_KEY)) || DEFAULT_NUM_CTX);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [streaming, setStreaming] = useState("");
+  const [input, setInput] = useState("");
+  const [running, setRunning] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [load, setLoad] = useState<LoadedModel | null>(null);
+  // Fixed for the life of the process — fetched once, not polled with the split.
+  const [totalVram, setTotalVram] = useState<number | null>(null);
+  const [pullName, setPullName] = useState<string | null>(null);
+  const [pull, setPull] = useState<PullState | null>(null);
+
+  const { entries } = useChatStore(chatFor(projectRoot));
+  const addEntry = useChatStore((s) => s.addEntry);
+  const clearChat = useChatStore((s) => s.clearChat);
+
+  const stopRef = useRef(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  async function loadModels() {
+    setModelsError(null);
+    try {
+      const list = await listModels();
+      setModels(list);
+      setModel((current) => (current && list.some((m) => m.name === current) ? current : (list[0]?.name ?? "")));
+    } catch (err) {
+      setModelsError((err as Error).message);
+    }
+  }
+
+  useEffect(() => {
+    void loadModels();
+    void totalVramGb().then(setTotalVram);
+  }, []);
+
+  useEffect(() => {
+    if (model) localStorage.setItem(MODEL_KEY, model);
+  }, [model]);
+
+  useEffect(() => {
+    localStorage.setItem(CTX_KEY, String(numCtx));
+  }, [numCtx]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [entries, streaming]);
+
+  async function startPull(name: string) {
+    if (!name || pull) return;
+    let last: PullState = { layers: {}, status: "starting…", done: false };
+    setPull(last);
+    try {
+      await pullModel(name, (s) => {
+        last = s;
+        setPull(s);
+      });
+    } catch (err) {
+      setPull({ layers: {}, status: String(err), done: true, error: String(err) });
+      return;
+    }
+    // A failed pull leaves the row up showing why, rather than closing over the
+    // reason — Ollama reports a bad model name in the stream, not as a throw.
+    if (last.error) return;
+    await loadModels();
+    setModel(name);
+    setPullName(null);
+    setPull(null);
+  }
+
+  // A model that doesn't fit in VRAM falls back to CPU and takes minutes per
+  // turn — a live counter is the difference between "working" and "hung".
+  useEffect(() => {
+    if (!running) return;
+    const started = Date.now();
+    const id = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 500);
+    return () => clearInterval(id);
+  }, [running]);
+
+  // Ollama only reports a split for a model that's actually loaded, and loading
+  // happens on the first call — so this has to keep looking during a turn, not
+  // once before it. Idle models unload themselves, hence the re-check on switch.
+  useEffect(() => {
+    if (!model) return setLoad(null);
+    let alive = true;
+    const check = () =>
+      loadedModel(model).then(
+        (l) => alive && setLoad(l),
+        () => alive && setLoad(null)
+      );
+    void check();
+    if (!running) return () => void (alive = false);
+    const id = setInterval(check, LOAD_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [model, running]);
+
+  // Conversations are keyed by project root in the store, so switching projects
+  // switches transcripts rather than resetting one — only the in-flight token
+  // buffer, which belongs to the project being left, has to go.
+  useEffect(() => {
+    setStreaming("");
+  }, [projectRoot]);
+
+  // A project created from a prompt runs that prompt as its first turn. Waits
+  // on `model` because the picker is populated by an async /api/tags call.
+  useEffect(() => {
+    if (!pendingPrompt || !model || running) return;
+    const prompt = useHearthStore.getState().takePendingPrompt();
+    if (prompt) void send(prompt);
+  }, [pendingPrompt, model, running]);
+
+  async function send(prompt: string) {
+    if (!prompt || running || !projectRoot || !model) return;
+    const root = projectRoot;
+    const add = (entry: Entry) => addEntry(root, entry);
+
+    add({ kind: "user", text: prompt });
+    setStreaming("");
+    setRunning(true);
+    setElapsed(0);
+    stopRef.current = false;
+
+    // Baseline the project before the turn, so the checkpoint below is this
+    // turn's diff rather than the whole project. First call on a large repo
+    // does an `add -A`; it runs under the "thinking…" indicator rather than
+    // before it for that reason. A failure here surfaces from the commit.
+    try {
+      await ensureRepo(root);
+    } catch {
+      /* reported by the checkpoint attempt after the turn */
+    }
+
+    const history = await runAgent({
+      model,
+      root,
+      prompt,
+      history: useChatStore.getState().chats[root]?.history ?? [],
+      activeFile: activePath,
+      numCtx,
+      shouldStop: () => stopRef.current,
+      onEvent: (event) => {
+        switch (event.type) {
+          case "token":
+            setStreaming((s) => s + event.text);
+            break;
+          case "assistant":
+            setStreaming("");
+            add({ kind: "assistant", text: event.content });
+            break;
+          case "tool":
+            add({ kind: "tool", label: event.label, ok: event.ok, detail: event.detail });
+            break;
+          case "error":
+            add({ kind: "error", text: event.text });
+            break;
+          case "done":
+            setStreaming("");
+            if (event.reason !== "finished" && event.reason !== "replied") {
+              add({ kind: "note", text: event.reason });
+            }
+            break;
+        }
+      },
+    });
+
+    useChatStore.getState().setHistory(root, history);
+
+    // Checkpoint the turn (plan §7). Wrapped, because git can be missing
+    // entirely and a failed commit must not cost the user the turn that
+    // produced the changes — only the ability to review and roll it back.
+    try {
+      const sha = await commitAll(root, prompt);
+      if (sha) add({ kind: "checkpoint", sha, files: await changedFiles(root, sha) });
+    } catch (err) {
+      add({ kind: "note", text: `no checkpoint: ${(err as Error).message}` });
+    }
+
+    setRunning(false);
+  }
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-neutral-900">
+      <div className="flex h-10 shrink-0 items-center gap-2 border-b border-neutral-800 px-2">
+        <select
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          className="min-w-0 flex-1 truncate rounded bg-neutral-800 px-1.5 py-1 text-[12px] text-neutral-200 outline-none"
+        >
+          {models.length === 0 && <option value="">no models</option>}
+          {models.map((m) => (
+            <option key={m.name} value={m.name}>
+              {m.name} · {m.sizeGb.toFixed(1)}GB
+            </option>
+          ))}
+        </select>
+        <select
+          value={numCtx}
+          onChange={(e) => setNumCtx(Number(e.target.value))}
+          title="Context window. Larger lets the agent hold more files at once, but the KV cache comes out of the same VRAM — push it too far and the model spills to CPU."
+          className="shrink-0 rounded bg-neutral-800 px-1.5 py-1 text-[12px] text-neutral-400 outline-none"
+        >
+          {CTX_CHOICES.map((n) => (
+            <option key={n} value={n}>
+              {n / 1024}k
+            </option>
+          ))}
+        </select>
+        {load && (
+          <LoadBadge
+            load={load}
+            numCtx={numCtx}
+            totalVram={totalVram}
+            onUnload={
+              running
+                ? undefined
+                : () => {
+                    void unloadModel(load.name).then(() => setLoad(null));
+                  }
+            }
+          />
+        )}
+        <button
+          onClick={() => setPullName((v) => (v === null ? "" : null))}
+          title="Download a model"
+          className="shrink-0 rounded bg-neutral-800 px-2 py-1 text-[12px] text-neutral-300 hover:bg-neutral-700"
+        >
+          +
+        </button>
+        <button
+          onClick={() => {
+            if (projectRoot) clearChat(projectRoot);
+            setStreaming("");
+          }}
+          title="New chat"
+          className="shrink-0 rounded bg-neutral-800 px-2 py-1 text-[12px] text-neutral-300 hover:bg-neutral-700"
+        >
+          New
+        </button>
+      </div>
+
+      {pullName !== null && (
+        <div className="shrink-0 border-b border-neutral-800 px-2 py-1.5">
+          <div className="flex items-center gap-2">
+            <input
+              value={pullName}
+              onChange={(e) => setPullName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void startPull(pullName.trim())}
+              disabled={!!pull}
+              autoFocus
+              placeholder="model to pull, e.g. devstral:24b"
+              className="min-w-0 flex-1 rounded bg-neutral-800 px-1.5 py-1 text-[12px] text-neutral-100 outline-none placeholder:text-neutral-600 disabled:opacity-50"
+            />
+            <button
+              onClick={() => void startPull(pullName.trim())}
+              disabled={!pullName.trim() || !!pull}
+              className="shrink-0 rounded bg-neutral-700 px-2 py-1 text-[12px] text-neutral-100 hover:bg-neutral-600 disabled:opacity-40"
+            >
+              Pull
+            </button>
+          </div>
+          {pull && (
+            <div className={`mt-1 text-[11px] ${pull.error ? "text-red-400" : "text-neutral-500"}`}>
+              {/* Multi-GB and minutes long — the status text carries the phases
+                  that have no byte count at all (manifest, verify, write). */}
+              {pull.status}
+              {pullPercent(pull) !== null && ` · ${pullPercent(pull)}%`}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-2">
+        {modelsError && (
+          <div className="rounded border border-red-900 bg-red-950/40 p-2 text-[12px] text-red-300">
+            {modelsError}
+            <button onClick={() => void loadModels()} className="ml-2 underline">
+              retry
+            </button>
+          </div>
+        )}
+        {entries.map((entry, i) => {
+          if (entry.kind === "tool") return <ToolRow key={i} entry={entry} />;
+          if (entry.kind === "checkpoint")
+            return projectRoot ? <CheckpointCard key={i} entry={entry} root={projectRoot} /> : null;
+          if (entry.kind === "user")
+            return (
+              <div key={i} className="whitespace-pre-wrap rounded bg-neutral-800 px-2 py-1.5 text-[13px] text-neutral-100">
+                {entry.text}
+              </div>
+            );
+          if (entry.kind === "error")
+            return (
+              <div key={i} className="whitespace-pre-wrap rounded border border-red-900 bg-red-950/40 px-2 py-1.5 text-[12px] text-red-300">
+                {entry.text}
+              </div>
+            );
+          if (entry.kind === "note")
+            return (
+              <div key={i} className="px-2 text-[11px] uppercase tracking-wide text-neutral-600">
+                {entry.text}
+              </div>
+            );
+          return <RichText key={i} text={entry.text} />;
+        })}
+
+        {streaming && <RichText text={streaming} />}
+        {running && (
+          <div className="px-2 text-[11px] text-neutral-500">
+            {streaming ? "writing" : "thinking"}… {elapsed}s
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      <div className="shrink-0 border-t border-neutral-800 p-2">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              setInput("");
+              void send(input.trim());
+            }
+          }}
+          rows={3}
+          placeholder="Ask the model to change this project…"
+          className="w-full resize-none rounded bg-neutral-800 p-2 text-[13px] text-neutral-100 outline-none placeholder:text-neutral-600 disabled:opacity-50"
+        />
+        <div className="mt-1 flex items-center justify-between">
+          <span className="text-[11px] text-neutral-600">Enter to send · Shift+Enter for a newline</span>
+          {running ? (
+            <button
+              onClick={() => {
+                stopRef.current = true;
+              }}
+              className="rounded bg-red-900/70 px-2 py-1 text-[12px] text-red-200 hover:bg-red-900"
+            >
+              Stop
+            </button>
+          ) : (
+            <button
+              onClick={() => {
+                setInput("");
+                void send(input.trim());
+              }}
+              disabled={!input.trim() || !model}
+              className="rounded bg-neutral-700 px-2.5 py-1 text-[12px] text-neutral-100 hover:bg-neutral-600 disabled:opacity-40"
+            >
+              Send
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

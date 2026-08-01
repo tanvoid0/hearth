@@ -23,4 +23,12 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Ollama talks HTTP on localhost. The request has to originate from Rust, not
+# the webview: Ollama rejects the packaged app's `http://tauri.localhost`
+# origin with a 403, and it would only appear to work in `tauri dev`.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# A real terminal needs a PTY, not piped stdio: without a TTY on the far side a
+# shell won't echo, won't line-edit, and won't emit the escape sequences xterm
+# renders. `run_dev`'s pipes are fine for a log; they can't back a prompt.
+portable-pty = "0.9"
 

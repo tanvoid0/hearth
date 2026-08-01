@@ -50,7 +50,7 @@ export function FileTree() {
   const rootChildren = dirChildren[projectRoot] ?? [];
 
   return (
-    <div className="overflow-y-auto py-1">
+    <div className="min-h-0 flex-1 overflow-y-auto py-1">
       {rootChildren.map((entry) => (
         <TreeNode key={entry.path} entry={entry} depth={0} />
       ))}
