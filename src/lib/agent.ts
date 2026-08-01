@@ -3,7 +3,7 @@ import { exportedSymbols, formatRepoMap, isSourceFile } from "./repomap";
 import { isSecretFile, redactEnv } from "./secrets";
 import { applyEdits, changedLines, resolveInProject, samePath, type Edit } from "./edit";
 import { CANCELLED, chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
-import { contextLimits, packHistory, stalled, worthRepairing, wroteThisTurn } from "./session";
+import { contextLimits, sendWindow, stalled, worthRepairing, wroteThisTurn } from "./session";
 import { useHearthStore } from "./store";
 import { useRunner } from "./runner";
 import { consoleTail, countErrorsSince, devLogTail } from "./runlog";
@@ -493,13 +493,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
   let wrote = resuming && wroteThisTurn(messages);
   /** One entry per tool call: the call and what it returned. See `stalled`. */
   const signatures: string[] = [];
+  /** Where the sent window starts. Carried across calls rather than recomputed,
+   *  which is the whole point — see `sendWindow`. */
+  let sentStart = 0;
 
   try {
     if (opts.plan && !resuming) {
       messages.push({ role: "user", content: PLAN_PROMPT });
+      const plannedWindow = sendWindow(messages, budget, sentStart);
+      sentStart = plannedWindow.start;
       const planned = await chat(
         model,
-        packHistory(messages, budget),
+        plannedWindow.messages,
         [], // no tools: the point is the thinking, not an early edit
         (text) => {
           if (!shouldStop()) onEvent({ type: "token", text });
@@ -530,12 +535,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
       // context long before it outgrows storage, and Ollama's own overflow
       // handling drops from the front — which silently takes the system prompt
       // with it, so the agent stops following its own instructions partway
-      // through a session. Re-packed every iteration because tool results
+      // through a session. Re-checked every iteration because tool results
       // (a file read is up to 40k chars) grow the list mid-turn, not just
-      // between turns.
+      // between turns — but the window only actually moves when it stops
+      // fitting, so the prefix Ollama caches on holds still in between.
+      const window = sendWindow(messages, budget, sentStart);
+      sentStart = window.start;
       const reply = await chat(
         model,
-        packHistory(messages, budget),
+        window.messages,
         TOOL_DEFS,
         (text) => {
           if (!shouldStop()) onEvent({ type: "token", text });

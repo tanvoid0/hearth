@@ -1364,6 +1364,62 @@ untouched fixture doesn't type-check clean — otherwise every task is handed
 errors the model didn't cause and burns its repair rounds chasing them, and
 nothing would say so.
 
+### §5's stable prompt prefix — the plan item nothing here had noticed
+
+Build plan §5 is titled "read this twice" and §9 lists a stable prefix as the
+*first* thing to reach for when turns are slow. Nothing above mentions it, and
+it was half-honoured.
+
+The half that was right: the system prompt is built once, on the turn that
+starts a conversation, and reused verbatim after that. It names the project root
+and the file the user has open — and that second one changes as the user clicks
+around, so rebuilding it per turn would have moved byte one of every prompt. It
+doesn't, because `systemPrompt` is only called when the history is empty.
+
+The half that was wrong: everything after it. `packHistory` answers a *storage*
+question — keep the newest that fit — so it is anchored at the newest message
+and every append moves where it starts. It was also what got sent, re-applied
+every iteration. Ollama reuses its KV cache only for a byte-identical prefix, so
+a window that slides by a message per iteration is a full prompt recompute on
+every call of a turn, and a turn is where the iterations are.
+
+**Not an edge case, which is what made it worth fixing.** At `num_ctx` 8192 the
+history budget is 24,576 chars and one file read is capped at half that. Two
+reads exhaust it, and gemma4's own recorded traces get there.
+
+`sendWindow` is `packHistory` with hysteresis: `start` moves forward only, and
+only when the window stops fitting — then it cuts back to `REFILL` of the budget
+so the next several appends land inside a window that hasn't moved. Simulated
+over a 48-append turn at the real budget:
+
+| | prefix changes in 48 appends |
+|---|---|
+| sliding (what shipped) | **48** |
+| refill 0.5 | 4 |
+| refill 0.6 – 0.9 | **7** |
+
+The band is flat, which is the useful part: the floor isn't set by the knob but
+by `contextLimits` capping one read at half the window, so two reads can't share
+a window at any refill. 0.5 buys its three extra cuts by holding back half the
+context, so 0.7 sits on the plateau and keeps more. The constant carries that
+table rather than a guess.
+
+Both invariants `packHistory` guards are kept — the system prompt survives every
+cut, and the window never opens on a tool result whose call was cut away, which
+is an answer to a question the model can't see. It lives in
+[`session.ts`](src/lib/session.ts), import-free and unit-tested; `packHistory`
+stays for storage, which is a genuinely different job and was conflated with
+this one once before.
+
+**Unmeasured: what it's worth in seconds against a live model.** The 48 → 7 is a
+simulation of the windowing rule, not a timing. Confirming §5's claim needs a
+controlled A/B on a long conversation, which is a bigger measurement than the
+fix. What was checked is that the loop still works through the new send path —
+`pnpm run probe -- gemma4:latest`, both scenarios, `finish` called, edit applied,
+checked and re-checked, 0 repair rounds.
+
+Applied in `app-loop.ts` as well as the app, so the two loops can't drift.
+
 ---
 
 ## Remaining work
@@ -1466,6 +1522,15 @@ decisions rather than backlog.
 - **Find/replace** was on the same deferred list and turns out to need nothing:
   Monaco's own Ctrl+F and Ctrl+H work, and the widget is better than anything
   worth writing here.
+- **There is no Settings surface.** §4.7 asks for one panel holding model
+  config, `num_ctx`, approval policies, allowlisted commands and theme. Four of
+  those exist scattered where they're used — `num_ctx` in the chat header, **Ask
+  first** under the composer — which is where a control is most useful and is
+  not obviously worth centralising. Two don't exist: there's no theme control at
+  all, and the command allowlist is deliberately hardcoded in Rust so a frontend
+  mistake can't widen it. That last one is a real disagreement with the plan
+  rather than a deferral: user-editable and un-widenable-from-the-frontend are
+  not the same allowlist, and the safe one was chosen.
 - **The console bridge is still vite-only**, and the non-vite case is now the
   only Milestone-A gap left. A Next or webpack project runs and previews; it
   just has no console capture, which `consoleTail` reports rather than passing
@@ -1650,7 +1715,8 @@ pnpm run tauri dev
 ```
 
 ```bash
-# Unit tests (115): path safety, search/replace, session packing, context
+# Unit tests (116): path safety, search/replace, session packing, prompt-prefix
+# stability, context
 # sizing, repair-round budgeting, interrupted-turn recovery, run-state machine,
 # dev-log and
 # missing-package parsing, pull progress, fenced-code splitting, checkpoint

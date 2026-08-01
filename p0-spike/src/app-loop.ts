@@ -14,7 +14,7 @@
 
 import { chat, type ChatMessage } from "./ollama.js";
 import { PLAN_ACK, PLAN_PROMPT, TOOL_DEFS, systemPrompt } from "../../src/lib/agent.ts";
-import { contextLimits, packHistory, stalled, worthRepairing } from "../../src/lib/session.ts";
+import { contextLimits, sendWindow, stalled, worthRepairing } from "../../src/lib/session.ts";
 
 /** Build plan §6's caps, and the app's. */
 const MAX_ITERATIONS = 15;
@@ -89,10 +89,15 @@ export async function appLoop(opts: {
       ? `get_errors[${trace.filter((t) => t.startsWith("get_errors")).length + 1}]`
       : name;
 
+  /** Carried across calls so the prompt prefix holds still. See `sendWindow`. */
+  let sentStart = 0;
+
   if (opts.plan) {
     messages.push({ role: "user", content: PLAN_PROMPT });
     // no tools: the point is the thinking, not an early edit
-    const { message: planned } = await chat(model, packHistory(messages, budget), []);
+    const planWindow = sendWindow(messages, budget, sentStart);
+    sentStart = planWindow.start;
+    const { message: planned } = await chat(model, planWindow.messages, []);
     messages.push(planned);
     messages.push({ role: "user", content: PLAN_ACK });
     planText = planned.content.trim();
@@ -101,8 +106,11 @@ export async function appLoop(opts: {
 
   for (; iterations < MAX_ITERATIONS; iterations++) {
     // Send a windowful, keep the whole thing — one file read can grow the list
-    // past the window mid-turn, so this is re-packed every iteration.
-    const { message } = await chat(model, packHistory(messages, budget), TOOL_DEFS);
+    // past the window mid-turn, so this is re-checked every iteration, and the
+    // window moves only when it stops fitting.
+    const window = sendWindow(messages, budget, sentStart);
+    sentStart = window.start;
+    const { message } = await chat(model, window.messages, TOOL_DEFS);
     messages.push(message);
 
     const calls = message.tool_calls ?? [];

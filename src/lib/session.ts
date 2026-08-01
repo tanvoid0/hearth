@@ -55,6 +55,76 @@ export function packHistory<T extends { role: string }>(messages: T[], budgetCha
 }
 
 /**
+ * How far below the budget a re-cut window lands. The cost of freezing the
+ * prefix is sending less than the window holds for a few iterations after each
+ * cut; lower means fewer cuts and more wasted window.
+ *
+ * Measured over a 48-append turn at `num_ctx` 8192 — eight rounds of
+ * read/edit/check, reads at the cap:
+ *
+ * | refill | prefix changes in 48 appends |
+ * |---|---|
+ * | sliding (no hysteresis) | 48 |
+ * | 0.5 | 4 |
+ * | 0.6 – 0.9 | 7 |
+ *
+ * So the band is flat and almost anything beats sliding. What sets the floor
+ * isn't this number: one file read is capped at half the window
+ * (`contextLimits`), so two of them can't share a window whatever the refill —
+ * 0.5 wins its extra three cuts by holding back half the context, which is the
+ * more expensive half of the trade. 0.7 sits on the plateau and keeps more.
+ */
+const REFILL = 0.7;
+
+/**
+ * The slice of the conversation to send, with a prefix that holds still.
+ *
+ * `packHistory` answers a storage question and is anchored at the *newest*
+ * message, so every append moves where it starts. Sent to a model that is what
+ * build plan §5 spends a section forbidding: Ollama reuses its KV cache only
+ * for a byte-identical prefix, so a window that slides by one message per
+ * iteration is recomputed from scratch on every call of a turn — and a turn is
+ * where the iterations are. §9 lists a stable prefix as the first thing to
+ * reach for when turns are slow.
+ *
+ * Two file reads exhaust the budget at `num_ctx` 8192, so this is the normal
+ * path, not the long tail.
+ *
+ * The fix is hysteresis: `start` only ever moves forward, and only when the
+ * window no longer fits — then it cuts back to `REFILL` of the budget so the
+ * next several appends land inside a window that hasn't moved. The caller keeps
+ * the returned `start` and hands it back.
+ *
+ * The system prompt survives and the window never opens on an orphaned tool
+ * result, exactly as `packHistory` guarantees — a model handed a tool result
+ * whose call was trimmed away is being shown an answer to a question it can't
+ * see.
+ */
+export function sendWindow<T extends { role: string }>(
+  messages: T[],
+  budgetChars: number,
+  prevStart = 0
+): { messages: T[]; start: number } {
+  const floor = messages[0]?.role === "system" ? 1 : 0;
+  const system = messages.slice(0, floor);
+  let start = Math.max(prevStart, floor);
+  if (jsonSize(messages.slice(start)) > budgetChars) {
+    const kept = trimForStorage(messages.slice(floor), Math.floor(budgetChars * REFILL));
+    // Forward-only even if the re-cut lands earlier, which `trimForStorage`'s
+    // keep-one-oversized rule can do: going back would re-expand the prefix and
+    // cost the cache the cut was paying for.
+    start = Math.max(start, messages.length - kept.length);
+  }
+  while (start < messages.length && messages[start].role === "tool") start++;
+  return { messages: [...system, ...messages.slice(start)], start };
+}
+
+/** Matches what `trimForStorage` counts, so the two agree on "over budget". */
+function jsonSize(items: unknown[]): number {
+  return items.reduce<number>((n, item) => n + JSON.stringify(item).length, 0);
+}
+
+/**
  * Has the agent stopped getting anywhere?
  *
  * `signatures` are one entry per tool call, each combining the call *and* what

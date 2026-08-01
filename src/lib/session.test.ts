@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   contextLimits,
   packHistory,
+  sendWindow,
   packTab,
   rebaseTab,
   stalled,
@@ -63,6 +64,55 @@ test("packHistory keeps the system prompt and drops orphaned tool results", () =
     "a tool result must never lead the restored history",
   );
   assert.deepEqual(packed.at(-1), { role: "user", content: "next" });
+});
+
+test("the sent window holds its prefix still while a turn grows", () => {
+  // Build plan §5: Ollama reuses its KV cache only for a byte-identical
+  // prefix, so what matters is that appending doesn't shift where the window
+  // starts. A turn is a dozen appends, and `packHistory` moves on every one.
+  const messages: Array<{ role: string; content: string }> = [
+    { role: "system", content: "you are working in C:/proj" },
+    { role: "user", content: "rename the button" },
+  ];
+  const budget = 2000;
+
+  let start = 0;
+  const starts: number[] = [];
+  const prefixes: string[] = [];
+  // Each pair is an assistant turn plus a file read, which is what actually
+  // fills the window — 12 of them takes it well past the budget.
+  for (let i = 0; i < 12; i++) {
+    messages.push({ role: "assistant", content: `step ${i}` });
+    messages.push({ role: "tool", content: "x".repeat(300) });
+    const w = sendWindow(messages, budget, start);
+    start = w.start;
+    starts.push(start);
+    prefixes.push(JSON.stringify(w.messages.slice(0, 2)));
+
+    assert.equal(w.messages[0].role, "system", "the system prompt must survive every cut");
+    assert.ok(
+      w.messages.every((m, j) => j === 0 || m.role !== "tool" || w.messages[j - 1]?.role === "assistant"),
+      "the window must never open on a tool result whose call was cut away",
+    );
+    assert.ok(
+      JSON.stringify(w.messages.slice(1)).length <= budget,
+      "a window that never fits is not a window",
+    );
+  }
+
+  assert.ok(
+    starts.every((s, i) => i === 0 || s >= starts[i - 1]),
+    "the window may only ever move forward — going back re-expands the prefix",
+  );
+  // The point of the whole thing: a sliding window would produce a new prefix
+  // on every append, and pay for a full prompt recompute each time.
+  const moves = starts.filter((s, i) => i > 0 && s !== starts[i - 1]).length;
+  assert.ok(moves > 0, "12 file reads at this budget must force at least one cut, or the test proves nothing");
+  assert.ok(moves < starts.length / 2, `the window moved ${moves} times in ${starts.length} appends`);
+  assert.ok(
+    new Set(prefixes).size === moves + 1,
+    "the prefix must change only when the window moves, and not otherwise",
+  );
 });
 
 test("a turn interrupted mid-flight comes back resumable, and out of history", () => {
