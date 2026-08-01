@@ -86,10 +86,9 @@ export const useRunner = create<RunnerState>((set, get) => ({
   markConsole: () => set((s) => ({ consoleMark: s.consoleLog.length })),
 
   start: async (root, script = get().script) => {
+    // Claimed before the first await, or two quick clicks both get past the
+    // guard and race to spawn a server.
     if (get().running) return;
-    const scripts = await projectScripts(root);
-    const serve = scripts.find((s) => s.name === script)?.serve ?? script === DEFAULT_SCRIPT;
-
     set({
       running: true,
       status: "starting",
@@ -100,6 +99,9 @@ export const useRunner = create<RunnerState>((set, get) => ({
       consoleAttached: false,
       consoleMark: 0,
     });
+
+    const scripts = await projectScripts(root);
+    const serve = scripts.find((s) => s.name === script)?.serve ?? script === DEFAULT_SCRIPT;
 
     // The console bridge for a project Hearth didn't scaffold: a generated vite
     // config that wraps the project's own and injects the snippet. Written per
