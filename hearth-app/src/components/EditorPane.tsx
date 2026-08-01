@@ -3,7 +3,9 @@ import Editor, { DiffEditor } from "@monaco-editor/react";
 import type * as monaco from "monaco-editor";
 import { useHearthStore, type DiffView } from "../lib/store";
 import { useLsp } from "../lib/lsp";
-import { attachModel, findReferences, SHIFT_F12 } from "../lib/monaco-ts";
+import { attachModel, findReferences, CTRL_K, SHIFT_F12 } from "../lib/monaco-ts";
+import { inlineEdit } from "../lib/inline";
+import { cancelChat } from "../lib/ollama";
 import { fileHunks, revertHunk } from "../lib/git";
 import type { Hunk } from "../lib/gitdiff";
 
@@ -108,6 +110,46 @@ export function EditorPane() {
   // State as well as a ref: the decoration effect below has to re-run when the
   // editor finishes mounting, and a ref assignment doesn't re-render.
   const [editor, setEditor] = useState<monaco.editor.IStandaloneCodeEditor | null>(null);
+  // Ctrl+K: the selection to rewrite, held while the instruction is typed.
+  const [inline, setInline] = useState<{ range: monaco.IRange; code: string } | null>(null);
+  const [instruction, setInstruction] = useState("");
+  const [inlineBusy, setInlineBusy] = useState(false);
+  const [inlineError, setInlineError] = useState<string | null>(null);
+  const inlineCancel = useRef("");
+
+  async function runInline() {
+    if (!inline || !editor || !activeTab || !instruction.trim()) return;
+    setInlineBusy(true);
+    setInlineError(null);
+    inlineCancel.current = `inline#${Date.now()}`;
+    try {
+      const replacement = await inlineEdit({
+        path: activeTab.path,
+        language: languageFor(activeTab.path),
+        selection: inline.code,
+        instruction: instruction.trim(),
+        cancelId: inlineCancel.current,
+      });
+      // Through the editor rather than the store, so it lands as one undo step
+      // and the tab goes dirty like anything else you typed.
+      editor.executeEdits("hearth.inlineEdit", [{ range: inline.range, text: replacement }]);
+      editor.focus();
+      setInline(null);
+      setInstruction("");
+    } catch (err) {
+      setInlineError((err as Error).message);
+    } finally {
+      setInlineBusy(false);
+    }
+  }
+
+  function closeInline() {
+    if (inlineBusy) void cancelChat(inlineCancel.current);
+    setInline(null);
+    setInstruction("");
+    setInlineError(null);
+    editor?.focus();
+  }
 
   // What the agent just wrote, marked in place. Without this a change you
   // didn't type is invisible unless you already know where to look — and the
@@ -223,26 +265,92 @@ export function EditorPane() {
       run: (self) => void findReferences(self),
     });
 
+    // Ctrl+K. With nothing selected it takes the current line, which is the
+    // common case — you put the cursor on the line you want changed.
+    mounted.addAction({
+      id: "hearth.inlineEdit",
+      label: "Edit with the model",
+      keybindings: [CTRL_K],
+      contextMenuGroupId: "modification",
+      run: (self) => {
+        const target = self.getModel();
+        const selection = self.getSelection();
+        if (!target || !selection) return;
+        const range = selection.isEmpty()
+          ? {
+              startLineNumber: selection.startLineNumber,
+              startColumn: 1,
+              endLineNumber: selection.startLineNumber,
+              endColumn: target.getLineMaxColumn(selection.startLineNumber),
+            }
+          : selection;
+        setInlineError(null);
+        setInline({ range, code: target.getValueInRange(range) });
+      },
+    });
+
     // The effect above may have run before Monaco finished loading, so the
     // pending jump is applied here too rather than only there.
     applyReveal(mounted);
   }
 
   return (
-    <Editor
-      key={activeTab.path}
-      path={activeTab.path}
-      language={languageFor(activeTab.path)}
-      value={activeTab.content}
-      theme="vs-dark"
-      onMount={handleMount}
-      onChange={(value) => setTabContent(activeTab.path, value ?? "")}
-      options={{
-        fontSize: 13,
-        minimap: { enabled: false },
-        automaticLayout: true,
-        tabSize: 2,
-      }}
-    />
+    <div className="flex h-full flex-col">
+      <div className="min-h-0 flex-1">
+        <Editor
+          key={activeTab.path}
+          path={activeTab.path}
+          language={languageFor(activeTab.path)}
+          value={activeTab.content}
+          theme="vs-dark"
+          onMount={handleMount}
+          onChange={(value) => setTabContent(activeTab.path, value ?? "")}
+          options={{
+            fontSize: 13,
+            minimap: { enabled: false },
+            automaticLayout: true,
+            tabSize: 2,
+          }}
+        />
+      </div>
+
+      {/* Under the editor rather than floating over the cursor: a widget at the
+          cursor covers the code you are about to change, which is the code you
+          want to be looking at while you describe the change. */}
+      {inline && (
+        <div className="shrink-0 border-t border-sky-900/60 bg-neutral-900 p-2">
+          <div className="flex items-center gap-2">
+            <span className="shrink-0 text-[11px] text-neutral-500">
+              {inline.range.startLineNumber === inline.range.endLineNumber
+                ? `line ${inline.range.startLineNumber}`
+                : `lines ${inline.range.startLineNumber}–${inline.range.endLineNumber}`}
+            </span>
+            <input
+              value={instruction}
+              onChange={(e) => setInstruction(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void runInline();
+                if (e.key === "Escape") closeInline();
+              }}
+              disabled={inlineBusy}
+              autoFocus
+              placeholder="What should this become?"
+              className="min-w-0 flex-1 rounded bg-neutral-800 px-2 py-1 text-[12px] text-neutral-100 outline-none placeholder:text-neutral-600 disabled:opacity-50"
+            />
+            <button
+              onClick={closeInline}
+              className="shrink-0 rounded px-1.5 py-1 text-[12px] text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+            >
+              {inlineBusy ? "Cancel" : "Esc"}
+            </button>
+          </div>
+          {(inlineBusy || inlineError) && (
+            <div className={`mt-1 text-[11px] ${inlineError ? "text-red-400" : "text-neutral-500"}`}>
+              {inlineError ?? "rewriting…"}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

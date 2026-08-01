@@ -27,6 +27,7 @@ export function PreviewPane() {
   // user's to type.
   const [path, setPath] = useState("/");
   const [draft, setDraft] = useState("/");
+  const [picking, setPicking] = useState(false);
 
   useEffect(() => {
     if (projectRoot) void projectScripts(projectRoot).then(setScripts);
@@ -56,8 +57,17 @@ export function PreviewPane() {
       const data = e.data;
       if (!data || data.source !== "hearth" || typeof data.kind !== "string") return;
       const { attachConsole, pushConsole } = useRunner.getState();
-      if (data.kind === "ready") attachConsole();
-      else pushConsole(data.kind, String(data.text ?? ""));
+      if (data.kind === "ready") {
+        attachConsole();
+        setPicking(false); // a reload is a new document, and it isn't picking
+      } else if (data.kind === "picked") {
+        // Into the composer rather than straight to the agent: what you clicked
+        // is the subject of a request, not the request.
+        useHearthStore.getState().appendComposer(`the element \`${String(data.text ?? "")}\``);
+        setPicking(false);
+      } else {
+        pushConsole(data.kind, String(data.text ?? ""));
+      }
     }
     window.addEventListener("message", onMessage);
     return () => {
@@ -65,6 +75,14 @@ export function PreviewPane() {
       useRunner.getState().detachConsole();
     };
   }, []);
+
+  /** Plan §12's element picker. The page does the picking (it's cross-origin);
+   *  this only turns it on and off. */
+  function togglePicking() {
+    const next = !picking;
+    setPicking(next);
+    frame.current?.contentWindow?.postMessage({ source: "hearth-parent", picking: next }, "*");
+  }
 
   function navigate() {
     const next = draft.startsWith("/") ? draft : `/${draft}`;
@@ -140,6 +158,18 @@ export function PreviewPane() {
           <span className={`min-w-0 flex-1 truncate text-[11px] ${status === "crashed" ? "text-red-400" : "text-neutral-500"}`}>
             {log.length > 0 && status !== "port-conflict" ? (log[log.length - 1] ?? statusText) : statusText}
           </span>
+        )}
+
+        {url && (
+          <button
+            onClick={togglePicking}
+            title="Click something in the page to name it in the agent prompt. Needs the console bridge, so a project Hearth didn't scaffold has to be running through the generated vite config."
+            className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] ${
+              picking ? "bg-sky-900 text-sky-100" : "bg-neutral-800 text-neutral-400 hover:text-neutral-200"
+            }`}
+          >
+            ⌖
+          </button>
         )}
 
         {url && (

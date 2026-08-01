@@ -108,6 +108,7 @@ function toSymbols(node: any): monaco.languages.DocumentSymbol[] {
 /** Monaco's own keybinding constants, re-exported so components that import
  *  Monaco only as a type don't have to hardcode the numbers. */
 export const SHIFT_F12 = monaco.KeyMod.Shift | monaco.KeyCode.F12;
+export const CTRL_K = monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK;
 
 /** tsserver's rename result for one file: the file, and every span in it. */
 interface RenameGroup {

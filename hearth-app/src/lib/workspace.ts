@@ -106,6 +106,64 @@ export const BRIDGE_JS = `(function () {
   // agent's bug to fix, and counting it as one would spend every repair round
   // on somebody else's server. No timing in the text, so a poll collapses into
   // one line with a count instead of filling the buffer.
+  // The element picker of plan §12. It lives here rather than in the preview
+  // pane for the same reason the console patch does: the iframe is a different
+  // origin, so the parent can't attach a listener to the page. Capture-phase
+  // listeners, so a button's own onClick doesn't get there first and navigate
+  // away from the thing being pointed at.
+  var picking = false;
+  var hovered = null;
+  var mark = function (el, on) {
+    if (el && el.style) el.style.outline = on ? "2px solid #38bdf8" : "";
+  };
+  var describe = function (el) {
+    var parts = [];
+    for (var n = el; n && n.nodeType === 1 && parts.length < 4; n = n.parentElement) {
+      var part = n.tagName.toLowerCase();
+      if (n.id) {
+        parts.unshift(part + "#" + n.id);
+        break;
+      }
+      if (n.className && typeof n.className === "string") {
+        part += "." + n.className.trim().split(/\\s+/).slice(0, 2).join(".");
+      }
+      parts.unshift(part);
+    }
+    var text = (el.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 80);
+    return parts.join(" > ") + (text ? ' — "' + text + '"' : "");
+  };
+  addEventListener("message", function (e) {
+    if (!e.data || e.data.source !== "hearth-parent") return;
+    picking = !!e.data.picking;
+    if (!picking) {
+      mark(hovered, false);
+      hovered = null;
+    }
+  });
+  addEventListener(
+    "mouseover",
+    function (e) {
+      if (!picking) return;
+      mark(hovered, false);
+      hovered = e.target;
+      mark(hovered, true);
+    },
+    true
+  );
+  addEventListener(
+    "click",
+    function (e) {
+      if (!picking) return;
+      e.preventDefault();
+      e.stopPropagation();
+      picking = false;
+      mark(e.target, false);
+      hovered = null;
+      send("picked", describe(e.target));
+    },
+    true
+  );
+
   var fetched = window.fetch;
   if (fetched) {
     window.fetch = function () {

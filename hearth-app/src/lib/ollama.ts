@@ -21,6 +21,19 @@ export interface ModelInfo {
  *  holds a system prompt, a file read and a few tool results. */
 export const DEFAULT_NUM_CTX = 8192;
 
+// The agent panel owns these controls; anything else that needs a one-off model
+// call reads the same keys rather than growing a second source of truth.
+export const MODEL_KEY = "hearth.model";
+export const CTX_KEY = "hearth.numCtx";
+
+export function currentModel(): string {
+  return localStorage.getItem(MODEL_KEY) ?? "";
+}
+
+export function currentNumCtx(): number {
+  return Number(localStorage.getItem(CTX_KEY)) || DEFAULT_NUM_CTX;
+}
+
 export async function listModels(): Promise<ModelInfo[]> {
   const data = await invoke<{ models?: Array<{ name: string; size: number }> }>("ollama_models");
   return (data.models ?? [])

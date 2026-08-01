@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { splitFences } from "./markdown.ts";
+import { codeFromReply, splitFences } from "./markdown.ts";
 
 test("plain prose comes back as one segment", () => {
   assert.deepEqual(splitFences("hello\nthere"), [{ kind: "text", text: "hello\nthere" }]);
@@ -45,4 +45,21 @@ test("inline backticks are left alone", () => {
   // Only ``` at the start of a line opens a block — a sentence mentioning
   // `useState` must not swallow the rest of the reply.
   assert.deepEqual(splitFences("use `useState` here"), [{ kind: "text", text: "use `useState` here" }]);
+});
+
+test("codeFromReply takes the code when the model fences it anyway", () => {
+  // The instruction says "no fences". Models add them regardless, and pasting
+  // a ``` into the middle of a source file is the worst possible failure here.
+  assert.equal(codeFromReply("Here you go:\n```js\nconst x = 1;\n```\nHope that helps!"), "const x = 1;");
+  assert.equal(codeFromReply("```\nplain\n```"), "plain");
+});
+
+test("codeFromReply passes an unfenced reply through", () => {
+  assert.equal(codeFromReply("const x = 1;\n"), "const x = 1;");
+});
+
+test("codeFromReply keeps the indentation of the first line", () => {
+  // The replacement lands inside an existing block; losing its leading spaces
+  // reindents the whole selection.
+  assert.equal(codeFromReply("```js\n    indented();\n```"), "    indented();");
 });

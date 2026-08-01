@@ -20,6 +20,19 @@ const FENCE = /^```([^\n`]*)$/;
  * anyway, or a response would flicker between prose and code as it streams,
  * and code would vanish entirely until its closing fence landed.
  */
+/**
+ * The code out of a reply that was asked for code and nothing else.
+ *
+ * Models fence it whatever the instruction says, and some of them add a
+ * sentence either side. Taking the first fenced block when there is one, and
+ * the whole reply when there isn't, covers both without a prompt argument
+ * nobody wins.
+ */
+export function codeFromReply(reply: string): string {
+  const fenced = splitFences(reply).find((s) => s.kind === "code");
+  return (fenced ? fenced.code : reply).replace(/^\n+/, "").replace(/\s+$/, "");
+}
+
 export function splitFences(src: string): Segment[] {
   const segments: Segment[] = [];
   let text: string[] = [];

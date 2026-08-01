@@ -8,9 +8,11 @@ import { changeLabel, type FileChange } from "../lib/gitdiff";
 import { RichText } from "./RichText";
 import {
   cancelChat,
+  CTX_KEY,
   DEFAULT_NUM_CTX,
   listModels,
   loadedModel,
+  MODEL_KEY,
   pullModel,
   totalVramGb,
   unloadModel,
@@ -18,8 +20,6 @@ import {
   type ModelInfo,
 } from "../lib/ollama";
 
-const MODEL_KEY = "hearth.model";
-const CTX_KEY = "hearth.numCtx";
 const PLAN_KEY = "hearth.plan";
 const ASK_KEY = "hearth.ask";
 /** Only while a turn is in flight — that's when the split is worth knowing and
@@ -197,7 +197,9 @@ export function ChatPanel() {
   const [numCtx, setNumCtx] = useState(() => Number(localStorage.getItem(CTX_KEY)) || DEFAULT_NUM_CTX);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [streaming, setStreaming] = useState("");
-  const [input, setInput] = useState("");
+  // In the store, not local state: the preview's element picker writes into it.
+  const input = useHearthStore((s) => s.composer);
+  const setInput = useHearthStore((s) => s.setComposer);
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [load, setLoad] = useState<LoadedModel | null>(null);

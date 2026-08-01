@@ -32,6 +32,9 @@ interface HearthState {
   /** Set by newProject, consumed once by the chat panel — the prompt that
    *  created the project is also its first agent turn. */
   pendingPrompt: string | null;
+  /** The agent panel's input box. In the store rather than in the component so
+   *  the preview's element picker has somewhere to put what you clicked. */
+  composer: string;
   /** Takes over the editor pane while a checkpoint file is under review. */
   diff: DiffView | null;
   /** Lines the agent last wrote, by file, for the editor decoration. A change
@@ -44,6 +47,10 @@ interface HearthState {
   closeProject: () => void;
   setWorkspaceDir: (dir: string) => void;
   takePendingPrompt: () => string | null;
+  setComposer: (text: string) => void;
+  /** Add to whatever is already typed rather than replacing it: picking an
+   *  element is usually the *subject* of a sentence you have already started. */
+  appendComposer: (text: string) => void;
   toggleDir: (path: string) => Promise<void>;
   openFile: (path: string, name: string) => Promise<void>;
   setActivePath: (path: string) => void;
@@ -70,6 +77,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
   activePath: null,
   workspaceDir: null,
   pendingPrompt: null,
+  composer: "",
   diff: null,
   agentLines: {},
 
@@ -122,6 +130,11 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
     if (prompt) set({ pendingPrompt: null });
     return prompt;
   },
+
+  setComposer: (text: string) => set({ composer: text }),
+
+  appendComposer: (text: string) =>
+    set((state) => ({ composer: state.composer ? `${state.composer.replace(/\s+$/, "")} ${text}` : text })),
 
   toggleDir: async (path: string) => {
     const { expandedDirs, dirChildren } = get();
