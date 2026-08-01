@@ -10,12 +10,21 @@ export function TerminalPane({ id, root, visible }: { id: string; root: string; 
   const fitRef = useRef<FitAddon | null>(null);
   const searchRef = useRef<SearchAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const seq = useRef(0);
+  const sessionRef = useRef("");
   const [finding, setFinding] = useState(false);
   const [query, setQuery] = useState("");
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
+
+    // The prop id names the tab, which outlives any one mount of it. The PTY is
+    // keyed per mount instead: two mounts sharing a key means the first one's
+    // close — deferred, so it lands late — kills the shell the second just
+    // opened, which is exactly what StrictMode's double mount produces.
+    const session = `${id}#${seq.current++}`;
+    sessionRef.current = session;
 
     const term = new Terminal({
       fontSize: 12,
@@ -43,23 +52,23 @@ export function TerminalPane({ id, root, visible }: { id: string; root: string; 
       return true;
     });
 
-    // The open and the close have to be sequenced, not just fired: StrictMode
-    // mounts twice, and a close that lands after the second open would kill the
-    // shell that survives — leaving a pane that renders nothing forever.
+    // The open and the close still have to be sequenced, not just fired: a
+    // close that overtakes its own open finds nothing to close, and the shell
+    // that lands afterwards is left running with no pane attached to it.
     let nothingToClose = false;
-    const booted = ptyOpen(id, root, term.cols, term.rows, (chunk) => term.write(chunk)).catch((err: unknown) => {
+    const booted = ptyOpen(session, root, term.cols, term.rows, (chunk) => term.write(chunk)).catch((err: unknown) => {
       term.write(`\r\n\x1b[31m${String(err)}\x1b[0m\r\n`);
       nothingToClose = true;
     });
 
-    const typing = term.onData((data) => void ptyWrite(id, data));
+    const typing = term.onData((data) => void ptyWrite(session, data));
 
     // Both directions matter: xterm reflows its own buffer on its own, but a
     // shell that hasn't been told the new width keeps wrapping at the old one.
     const observer = new ResizeObserver(() => {
       if (!host.clientWidth) return; // hidden — measuring now would give nonsense
       fit.fit();
-      void ptyResize(id, term.cols, term.rows);
+      void ptyResize(session, term.cols, term.rows);
     });
     observer.observe(host);
 
@@ -67,7 +76,7 @@ export function TerminalPane({ id, root, visible }: { id: string; root: string; 
       observer.disconnect();
       typing.dispose();
       void booted.then(() => {
-        if (!nothingToClose) void ptyClose(id);
+        if (!nothingToClose) void ptyClose(session);
         term.dispose();
       });
     };
@@ -79,7 +88,7 @@ export function TerminalPane({ id, root, visible }: { id: string; root: string; 
     if (!visible || !fitRef.current) return;
     fitRef.current.fit();
     const { cols, rows } = fitRef.current.proposeDimensions() ?? {};
-    if (cols && rows) void ptyResize(id, cols, rows);
+    if (cols && rows) void ptyResize(sessionRef.current, cols, rows);
   }, [visible, id]);
 
   function closeSearch() {

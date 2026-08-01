@@ -220,12 +220,12 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
         // being served, and they exist before the app is ever run.
         await useLsp.getState().checkProject();
         const { status, problems } = useLsp.getState();
-        const { running, url, log, consoleAttached, consoleLog, consoleMark } = useRunner.getState();
+        const { status: run, url, log, consoleAttached, consoleLog, consoleMark } = useRunner.getState();
         return {
           ok: true,
           output: [
             problemTail(status === "ok" && !hasChecked() ? "idle" : status, problems, root),
-            devLogTail(running, url, log),
+            devLogTail(run, url, log),
             consoleTail(consoleAttached, consoleLog, consoleMark),
           ].join("\n\n"),
         };

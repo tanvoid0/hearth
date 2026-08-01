@@ -31,6 +31,66 @@ export function exitReason(line: string): string | null {
   return line.startsWith(MARK) ? line.slice(MARK.length).trim() : null;
 }
 
+/**
+ * Build plan §3's run states. The distinction that earns the machine is
+ * `installing` vs `starting`: a cold `npm install` runs for minutes with no
+ * output a user can read as progress, and "starting…" over the top of it is
+ * what makes a working app look hung.
+ */
+export type RunStatus = "stopped" | "installing" | "starting" | "ready" | "crashed" | "port-conflict";
+
+/** Vite's own words when `--strictPort` finds the port taken, and node's when
+ *  anything else does. Worth its own state rather than a generic crash: it's
+ *  the one failure that pressing Run again actually fixes, since the port is
+ *  allocated fresh each time. */
+const PORT_TAKEN = /port \d+ is already in use|EADDRINUSE/i;
+
+/** Rust's control lines for the phases it knows about — it's the only side that
+ *  can tell an install apart from the script that follows it. */
+const PHASES: Record<string, RunStatus> = {
+  "phase:installing": "installing",
+  "phase:starting": "starting",
+};
+
+/** True for lines that drive the machine but say nothing a user wants to read. */
+export function isPhaseLine(line: string): boolean {
+  const mark = exitReason(line);
+  return mark !== null && mark in PHASES;
+}
+
+/**
+ * Advance the run state on one line of output. `port` is 0 for a script that
+ * isn't a server, which is what stops a `build` script sitting at "starting"
+ * waiting for a URL that will never be printed.
+ */
+export function reduceStatus(status: RunStatus, line: string, port: number): RunStatus {
+  const mark = exitReason(line);
+  if (mark !== null) {
+    // Everything on the control channel that isn't a phase is the end of the
+    // run. A port conflict has already said the useful thing by then — the exit
+    // it causes shouldn't overwrite it with a bare "crashed".
+    return PHASES[mark] ?? (status === "port-conflict" ? status : "crashed");
+  }
+  if (PORT_TAKEN.test(line)) return "port-conflict";
+  if (port > 0 && readyUrl(line, port)) return "ready";
+  return status;
+}
+
+/** Whether the run is still live. `crashed` and `port-conflict` are over. */
+export function isRunning(status: RunStatus): boolean {
+  return status === "installing" || status === "starting" || status === "ready";
+}
+
+/** What the pane says when there's no URL to show instead. */
+export const STATUS_TEXT: Record<RunStatus, string> = {
+  stopped: "Not running",
+  installing: "Installing dependencies… (first run takes a few minutes)",
+  starting: "Starting…",
+  ready: "Ready",
+  crashed: "Exited",
+  "port-conflict": "Port already in use — press Run to try another",
+};
+
 /** Lines of dev-server output handed to the agent by `get_errors`. */
 export const TAIL_LINES = 40;
 
@@ -108,18 +168,27 @@ export function consoleTail(attached: boolean, entries: ConsoleEntry[], mark = 0
     .join("\n");
 }
 
+/** How each run state reads to the model. `crashed` and `port-conflict` used to
+ *  both arrive as "not running", which reads as "nobody pressed Run" — so a
+ *  server that died on the agent's own edit looked like one that was never
+ *  started. */
+const DEV_STATUS: Record<RunStatus, string> = {
+  stopped: "dev server not running — ask the user to press Run if you need to see build output",
+  installing: "dev server starting (installing dependencies)",
+  starting: "dev server starting (booting)",
+  ready: "dev server running",
+  crashed: "dev server exited — the tail below says why",
+  "port-conflict": "dev server could not start: the port was already in use (not a problem with the code)",
+};
+
 /**
  * What the agent sees of the dev server: status line plus the tail of its
  * output. Deliberately no error classifier — vite prints transform errors
  * straight to stdout, and a regex deciding what counts as an error is one more
  * thing to keep in step with vite's formatting.
  */
-export function devLogTail(running: boolean, url: string | null, log: string[], n = TAIL_LINES): string {
-  const status = url
-    ? `dev server running at ${url}`
-    : running
-      ? "dev server starting (installing or booting)"
-      : "dev server not running — ask the user to press Run if you need to see build output";
+export function devLogTail(state: RunStatus, url: string | null, log: string[], n = TAIL_LINES): string {
+  const status = state === "ready" && url ? `dev server running at ${url}` : DEV_STATUS[state];
   if (log.length === 0) return `${status}; no output yet`;
   const tail = log.slice(-n);
   const omitted = log.length - tail.length;

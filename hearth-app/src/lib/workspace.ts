@@ -62,49 +62,120 @@ export function uniqueName(base: string, taken: string[]): string {
  * preview iframe is a different origin (`localhost:PORT` vs `tauri.localhost`),
  * so the parent can't reach into it.
  *
- * ponytail: scaffolded projects only — a folder opened from outside Hearth has
- * no bridge and `consoleTail` says so. Injecting into arbitrary projects means
- * a vite plugin and a wrapped config; do that when opened repos become the
- * common case.
+ * Scaffolded projects get it inlined in their `index.html`; anything else gets
+ * it through `bridgeConfig` below. The guard at the top is what makes running
+ * both harmless — a scaffolded project opened through the wrapped config would
+ * otherwise patch `console` twice and report everything twice.
  */
+export const BRIDGE_JS = `(function () {
+  if (window.__hearthBridge) return;
+  window.__hearthBridge = 1;
+  var send = function (kind, text) {
+    try {
+      parent.postMessage({ source: "hearth", kind: kind, text: String(text).slice(0, 2000) }, "*");
+    } catch (e) {}
+  };
+  var fmt = function (args) {
+    return Array.prototype.map
+      .call(args, function (a) {
+        if (a instanceof Error) return a.stack || a.message;
+        if (typeof a === "string") return a;
+        try {
+          return JSON.stringify(a);
+        } catch (e) {
+          return String(a);
+        }
+      })
+      .join(" ");
+  };
+  ["error", "warn"].forEach(function (kind) {
+    var orig = console[kind];
+    console[kind] = function () {
+      send(kind, fmt(arguments));
+      orig.apply(console, arguments);
+    };
+  });
+  addEventListener("error", function (e) {
+    send("error", e.message + " (" + e.filename + ":" + e.lineno + ")");
+  });
+  addEventListener("unhandledrejection", function (e) {
+    send("error", "Unhandled rejection: " + ((e.reason && e.reason.stack) || e.reason));
+  });
+  // The network half of plan §4's browser panel. Reported as "net" rather than
+  // "error" on purpose: a 404 from an API the user doesn't control is not the
+  // agent's bug to fix, and counting it as one would spend every repair round
+  // on somebody else's server. No timing in the text, so a poll collapses into
+  // one line with a count instead of filling the buffer.
+  var fetched = window.fetch;
+  if (fetched) {
+    window.fetch = function () {
+      var url = String((arguments[0] && arguments[0].url) || arguments[0] || "");
+      return fetched.apply(this, arguments).then(
+        function (res) {
+          send("net", res.status + " " + url);
+          return res;
+        },
+        function (err) {
+          send("net", "failed " + url + " — " + err);
+          throw err;
+        }
+      );
+    };
+  }
+  send("ready", "");
+})();
+`;
+
 const CONSOLE_BRIDGE = `    <!-- Hearth: forwards runtime errors to the preview pane. Safe to delete. -->
     <script>
-      (function () {
-        var send = function (kind, text) {
-          try {
-            parent.postMessage({ source: "hearth", kind: kind, text: String(text).slice(0, 2000) }, "*");
-          } catch (e) {}
-        };
-        var fmt = function (args) {
-          return Array.prototype.map
-            .call(args, function (a) {
-              if (a instanceof Error) return a.stack || a.message;
-              if (typeof a === "string") return a;
-              try {
-                return JSON.stringify(a);
-              } catch (e) {
-                return String(a);
-              }
-            })
-            .join(" ");
-        };
-        ["error", "warn"].forEach(function (kind) {
-          var orig = console[kind];
-          console[kind] = function () {
-            send(kind, fmt(arguments));
-            orig.apply(console, arguments);
-          };
-        });
-        addEventListener("error", function (e) {
-          send("error", e.message + " (" + e.filename + ":" + e.lineno + ")");
-        });
-        addEventListener("unhandledrejection", function (e) {
-          send("error", "Unhandled rejection: " + ((e.reason && e.reason.stack) || e.reason));
-        });
-        send("ready", "");
-      })();
+${BRIDGE_JS.replace(/^/gm, "      ").trimEnd()}
     </script>
 `;
+
+/** Where the generated config is written, relative to the project root. Under
+ *  `.hearth/` so it's already excluded from checkpoints and the file tree, and
+ *  so it isn't a name vite searches for on its own — which is what stops the
+ *  wrapper below finding itself. */
+export const BRIDGE_CONFIG_REL = ".hearth/vite.hearth.mjs";
+
+/**
+ * A vite config that wraps the project's own and injects the console bridge.
+ *
+ * This is what extends `get_errors` past projects Hearth scaffolded. The
+ * alternative — writing the snippet into the user's `index.html` — is a change
+ * to their repo that they didn't ask for and would have to keep deleting.
+ *
+ * ponytail: vite only. A Next/webpack project opened here still runs, and
+ * `consoleTail` still says the bridge isn't connected; wire those up when a
+ * non-vite project is actually the thing someone is working on.
+ */
+export function bridgeConfig(): string {
+  return `// Generated by Hearth on every run — edit \`bridgeConfig\` in the app instead.
+// Wraps this project's own vite config and injects the console bridge, so
+// runtime errors in the preview reach the agent.
+import { defineConfig, loadConfigFromFile, mergeConfig } from "vite";
+
+const bridge = {
+  name: "hearth-console-bridge",
+  transformIndexHtml(html) {
+    return {
+      html,
+      tags: [{ tag: "script", children: ${JSON.stringify(BRIDGE_JS)}, injectTo: "head-prepend" }],
+    };
+  },
+};
+
+export default defineConfig(async (env) => {
+  // The project's real config, found the way vite would have found it. This
+  // file isn't a name vite searches for, so it can't load itself.
+  const own = (await loadConfigFromFile(env, undefined, process.cwd()))?.config ?? {};
+  // Pinning the root matters because a config loaded from elsewhere resolves
+  // relative paths against its own directory — but only pin it when the project
+  // hasn't deliberately pointed vite at a subdirectory of its own.
+  return mergeConfig(own, { plugins: [bridge], ...(own.root ? {} : { root: process.cwd() }) });
+});
+`;
+}
 
 /**
  * Starter scaffold, written before the agent ever runs.

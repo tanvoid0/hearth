@@ -168,9 +168,40 @@ async fn ollama_stream(path: &str, body: serde_json::Value, on_chunk: Channel<St
     Ok(())
 }
 
+/// Cancel handles for in-flight chat calls, keyed by the id the caller passed.
+static CHAT_CANCELS: LazyLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>> =
+    LazyLock::new(Default::default);
+
+/// One model turn, abortable.
+///
+/// A flag checked between chunks wouldn't be enough: the longest wait in a turn
+/// is the one *before* the first chunk, while Ollama loads a model — minutes on
+/// a model that spilled to CPU, which is exactly when Stop gets pressed. So the
+/// select drops the request future itself, which closes the connection and
+/// stops the generation rather than only ignoring it.
 #[tauri::command]
-async fn ollama_chat(body: serde_json::Value, on_chunk: Channel<String>) -> Result<(), String> {
-    ollama_stream("api/chat", body, on_chunk).await
+async fn ollama_chat(id: String, body: serde_json::Value, on_chunk: Channel<String>) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    CHAT_CANCELS.lock().unwrap().insert(id.clone(), tx);
+
+    let result = tokio::select! {
+        streamed = ollama_stream("api/chat", body, on_chunk) => streamed,
+        _ = rx => Err(CANCELLED.to_string()),
+    };
+
+    CHAT_CANCELS.lock().unwrap().remove(&id);
+    result
+}
+
+/// What a cancelled call rejects with. The frontend matches on it to tell a
+/// deliberate Stop apart from a model that fell over.
+const CANCELLED: &str = "cancelled";
+
+#[tauri::command]
+fn ollama_cancel(id: String) {
+    if let Some(tx) = CHAT_CANCELS.lock().unwrap().remove(&id) {
+        let _ = tx.send(());
+    }
 }
 
 /// Download a model, streaming `{status, total, completed}` progress. Multi-GB
@@ -201,21 +232,41 @@ fn free_port() -> Result<u16, String> {
         .map_err(|e| e.to_string())
 }
 
-fn npm(root: &str, args: &[&str]) -> Command {
-    // npm is a .cmd shim on Windows, which CreateProcess won't launch
+/// Which package manager the project uses, read off its lockfile.
+///
+/// The lockfile rather than a `packageManager` field or a preference: it's the
+/// file that decides whether the install the user already did counts. Running
+/// `npm install` in a pnpm project doesn't just pick the wrong tool, it writes
+/// a second lockfile and a `node_modules` layout the project's own scripts
+/// don't expect. npm is the fallback because every Node install has it.
+fn detect_pm(root: &str) -> &'static str {
+    [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("bun.lockb", "bun"),
+        ("bun.lock", "bun"),
+    ]
+    .into_iter()
+    .find(|(lock, _)| Path::new(root).join(lock).exists())
+    .map(|(_, pm)| pm)
+    .unwrap_or("npm")
+}
+
+fn pm(root: &str, exe: &str, args: &[&str]) -> Command {
+    // These are .cmd shims on Windows, which CreateProcess won't launch
     // directly. Going through cmd also gives `taskkill /T` a parent to walk
     // when stopping, since vite ends up a grandchild.
     #[cfg(windows)]
     let mut cmd = {
         use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
-        c.arg("/C").arg("npm").args(args);
+        c.arg("/C").arg(exe).args(args);
         c.creation_flags(CREATE_NO_WINDOW); // no console flash on every spawn
         c
     };
     #[cfg(not(windows))]
     let mut cmd = {
-        let mut c = Command::new("npm");
+        let mut c = Command::new(exe);
         c.args(args);
         c
     };
@@ -267,14 +318,37 @@ fn run_to_end(mut cmd: Command, ch: &Channel<String>) -> Result<i32, String> {
     status.map(|s| s.code().unwrap_or(-1))
 }
 
-/// Start (installing first if needed) the project's dev server and return the
-/// port it was told to listen on. Returns as soon as the process is spawned —
-/// `npm install` on a cold project runs for minutes, so readiness is reported
-/// through the event channel, not by making the caller wait here.
+/// How a package manager wants extra arguments handed to a script. npm and pnpm
+/// need `--` to stop reading them as their own flags; yarn 1 warns about it and
+/// bun rejects it.
+fn script_args<'a>(manager: &str, script: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["run", script];
+    if !extra.is_empty() && matches!(manager, "npm" | "pnpm") {
+        args.push("--");
+    }
+    args.extend_from_slice(extra);
+    args
+}
+
+/// Start (installing first if needed) one of the project's scripts, and return
+/// the port it was told to listen on — 0 for a script that isn't a server.
+///
+/// Returns as soon as the process is spawned: an install on a cold project runs
+/// for minutes, so progress is reported through the event channel rather than by
+/// making the caller wait here. `[hearth] phase:*` lines are the frontend's
+/// state machine (installing → starting → ready), and the port and config flags
+/// only go on when `serve` says this script is a vite dev server.
 #[tauri::command]
-fn run_dev(root: String, on_event: Channel<String>) -> Result<u16, String> {
+fn run_dev(
+    root: String,
+    script: String,
+    serve: bool,
+    config: Option<String>,
+    on_event: Channel<String>,
+) -> Result<u16, String> {
     stop_dev()?;
-    let port = free_port()?;
+    let port = if serve { free_port()? } else { 0 };
+    let manager = detect_pm(&root);
 
     std::thread::spawn(move || {
         let fail = |msg: String| {
@@ -282,20 +356,33 @@ fn run_dev(root: String, on_event: Channel<String>) -> Result<u16, String> {
         };
 
         if !Path::new(&root).join("node_modules").exists() {
-            let _ = on_event.send("$ npm install".into());
-            match run_to_end(npm(&root, &["install"]), &on_event) {
+            let _ = on_event.send(format!("{} phase:installing", MARK));
+            let _ = on_event.send(format!("$ {} install", manager));
+            match run_to_end(pm(&root, manager, &["install"]), &on_event) {
                 Ok(0) => {}
-                Ok(code) => return fail(format!("npm install failed (exit {})", code)),
-                Err(e) => return fail(format!("npm install could not start: {}", e)),
+                Ok(code) => return fail(format!("{} install failed (exit {})", manager, code)),
+                Err(e) => return fail(format!("{} install could not start: {}", manager, e)),
             }
         }
 
         let port = port.to_string();
-        let args = ["run", "dev", "--", "--port", &port, "--strictPort"];
-        let _ = on_event.send(format!("$ npm {}", args.join(" ")));
-        match run_to_end(npm(&root, &args), &on_event) {
-            Ok(code) => fail(format!("dev server exited (code {})", code)),
-            Err(e) => fail(format!("dev server could not start: {}", e)),
+        let mut extra: Vec<&str> = Vec::new();
+        if serve {
+            // A generated config that wraps the project's own — see
+            // `bridgeConfig` in workspace.ts. Only meaningful to vite, which is
+            // the only thing `serve` is ever true for.
+            if let Some(path) = config.as_deref() {
+                extra.extend_from_slice(&["--config", path]);
+            }
+            extra.extend_from_slice(&["--port", &port, "--strictPort"]);
+        }
+        let args = script_args(manager, &script, &extra);
+
+        let _ = on_event.send(format!("{} phase:starting", MARK));
+        let _ = on_event.send(format!("$ {} {}", manager, args.join(" ")));
+        match run_to_end(pm(&root, manager, &args), &on_event) {
+            Ok(code) => fail(format!("{} exited (code {})", script, code)),
+            Err(e) => fail(format!("{} could not start: {}", script, e)),
         }
     });
 
@@ -698,6 +785,85 @@ fn git_blocking(root: &str, args: &[String]) -> Result<GitOutput, String> {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SearchHit {
+    /// Relative to the project root with forward slashes — the same shape every
+    /// other path the agent is given takes.
+    path: String,
+    line: u32,
+    text: String,
+}
+
+/// Past this, a file is a bundle, a lockfile or a data dump. A hit in one is
+/// never what the caller meant, and reading them is most of what a search costs.
+const MAX_SEARCH_FILE_BYTES: u64 = 1_000_000;
+/// One matching line, clipped. A minified line that slipped under the size cap
+/// would otherwise be the entire result.
+const MAX_HIT_CHARS: usize = 300;
+
+/// Plain literal search across the project, case-insensitive.
+///
+/// Build plan §11 says "ripgrep search tool". This walks the tree itself rather
+/// than shelling out to `rg`: the binary isn't something an offline-first app
+/// can assume is installed, and a regex crate would be a dependency for a
+/// feature whose whole job is finding a name someone already knows how to spell.
+/// Regex is the upgrade path if literal search turns out not to be enough.
+#[tauri::command]
+fn search_files(root: String, query: String, max: usize) -> Result<Vec<SearchHit>, String> {
+    if query.trim().is_empty() {
+        return Err("empty search".into());
+    }
+    let mut hits = Vec::new();
+    search_dir(Path::new(&root), Path::new(&root), &query.to_lowercase(), max, &mut hits);
+    Ok(hits)
+}
+
+fn search_dir(dir: &Path, root: &Path, needle: &str, max: usize, hits: &mut Vec<SearchHit>) {
+    let Ok(read) = fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = read.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        if hits.len() >= max {
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+
+        if path.is_dir() {
+            // Dot-directories are tooling state (.git, .hearth, .vscode); dot
+            // *files* are project config someone may well be searching for.
+            if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
+                search_dir(&path, root, needle, max, hits);
+            }
+            continue;
+        }
+        if entry.metadata().map(|m| m.len() > MAX_SEARCH_FILE_BYTES).unwrap_or(true) {
+            continue;
+        }
+        // Binaries fail to decode here, which is the sniffer.
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+
+        for (i, line) in text.lines().enumerate() {
+            if hits.len() >= max {
+                return;
+            }
+            if line.to_lowercase().contains(needle) {
+                hits.push(SearchHit {
+                    path: rel.clone(),
+                    line: i as u32 + 1,
+                    text: line.trim().chars().take(MAX_HIT_CHARS).collect(),
+                });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,6 +1351,76 @@ mod tests {
     }
 
     #[test]
+    fn the_package_manager_comes_from_the_lockfile() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!("hearth-pm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let root_s = root.to_string_lossy().to_string();
+
+        // Nothing to go on: npm, which every Node install has.
+        assert_eq!(super::detect_pm(&root_s), "npm");
+
+        for (lock, expected) in [("package-lock.json", "npm"), ("bun.lockb", "bun"), ("yarn.lock", "yarn"), ("pnpm-lock.yaml", "pnpm")] {
+            fs::write(root.join(lock), "").unwrap();
+            assert_eq!(super::detect_pm(&root_s), expected, "after adding {lock}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_npm_and_pnpm_get_the_double_dash() {
+        // yarn 1 warns about it and bun refuses it, so a `--` sprayed at every
+        // manager breaks the two that aren't npm.
+        let extra = ["--port", "5173"];
+        assert_eq!(super::script_args("npm", "dev", &extra), ["run", "dev", "--", "--port", "5173"]);
+        assert_eq!(super::script_args("pnpm", "dev", &extra), ["run", "dev", "--", "--port", "5173"]);
+        assert_eq!(super::script_args("yarn", "dev", &extra), ["run", "dev", "--port", "5173"]);
+        assert_eq!(super::script_args("bun", "dev", &extra), ["run", "dev", "--port", "5173"]);
+        // A script with no arguments never needs the separator.
+        assert_eq!(super::script_args("npm", "build", &[]), ["run", "build"]);
+    }
+
+    #[test]
+    fn search_finds_matches_and_skips_what_it_should() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!("hearth-search-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("mkdir");
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("src/a.js"), "const total = 1;\nexport { total };\n").unwrap();
+        fs::write(root.join("src/b.js"), "// nothing here\n").unwrap();
+        fs::write(root.join(".env"), "TOTAL_KEY=1\n").unwrap();
+        // The two things a search must never drown in.
+        fs::write(root.join("node_modules/dep.js"), "total\n").unwrap();
+        fs::write(root.join(".git/config"), "total\n").unwrap();
+
+        let root_s = root.to_string_lossy().to_string();
+        let hits = super::search_files(root_s.clone(), "TOTAL".into(), 100).expect("search ran");
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+
+        // Case-insensitive, and a dotfile is project config someone may well be
+        // looking for — unlike a dot-directory, which is tooling state.
+        assert!(paths.contains(&".env"), "{paths:?}");
+        assert_eq!(paths.iter().filter(|p| **p == "src/a.js").count(), 2, "{paths:?}");
+        assert!(!paths.iter().any(|p| p.contains("node_modules")), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.contains(".git/")), "{paths:?}");
+
+        let first = hits.iter().find(|h| h.path == "src/a.js").unwrap();
+        assert_eq!(first.line, 1, "lines are 1-based, like every editor jump");
+
+        // The cap is what stops a common word costing the whole tree.
+        assert_eq!(super::search_files(root_s.clone(), "total".into(), 1).unwrap().len(), 1);
+        assert!(super::search_files(root_s, "   ".into(), 10).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn command_check_allows_the_project_toolchain() {
         for ok in ["npm test", "npm run build", "npx tsc --noEmit", "cargo test", "git status", "git diff HEAD"] {
             assert!(super::check_command(ok).is_ok(), "{} should be allowed", ok);
@@ -1294,9 +1530,11 @@ pub fn run() {
             ollama_unload,
             gpu_total_vram_gb,
             ollama_chat,
+            ollama_cancel,
             ollama_pull,
             run_dev,
             stop_dev,
+            search_files,
             pty_open,
             pty_write,
             pty_resize,

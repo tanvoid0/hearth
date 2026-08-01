@@ -9,9 +9,12 @@ import {
   devLogTail,
   exitReason,
   formatEntry,
+  isPhaseLine,
   pushEntry,
   readyUrl,
+  reduceStatus,
   type ConsoleEntry,
+  type RunStatus,
 } from "./runlog.ts";
 
 test("readyUrl fires on vite's banner", () => {
@@ -51,7 +54,7 @@ test("devLogTail sends the agent the newest lines, not the whole log", () => {
   // of npm install lines, and sending the head would spend the context window
   // on package names.
   const log = Array.from({ length: 100 }, (_, i) => `line ${i}`);
-  const out = devLogTail(true, "http://localhost:5173/", log, 5);
+  const out = devLogTail("ready", "http://localhost:5173/", log, 5);
   assert.match(out, /dev server running at http:\/\/localhost:5173\//);
   assert.match(out, /95 earlier lines omitted/);
   assert.ok(out.includes("line 99"));
@@ -61,9 +64,58 @@ test("devLogTail sends the agent the newest lines, not the whole log", () => {
 test("devLogTail distinguishes not-started from started-but-silent", () => {
   // "no errors" and "nothing is running" look identical if both return empty,
   // and the model would report a broken build as fixed.
-  assert.match(devLogTail(false, null, []), /not running/);
-  assert.match(devLogTail(true, null, []), /starting/);
-  assert.match(devLogTail(true, null, []), /no output yet/);
+  assert.match(devLogTail("stopped", null, []), /not running/);
+  assert.match(devLogTail("starting", null, []), /starting/);
+  assert.match(devLogTail("starting", null, []), /no output yet/);
+});
+
+test("devLogTail tells a crash apart from never having been started", () => {
+  // Both used to arrive as "not running", which reads as "nobody pressed Run"
+  // — so a server the agent's own edit killed looked like one that was never up.
+  assert.match(devLogTail("crashed", null, ["Error: boom"]), /exited/);
+  assert.doesNotMatch(devLogTail("crashed", null, ["Error: boom"]), /ask the user to press Run/);
+  // A taken port is somebody else's server, not a bug in the code — saying so
+  // is what stops a repair round being spent on it.
+  assert.match(devLogTail("port-conflict", null, []), /not a problem with the code/);
+});
+
+test("reduceStatus walks a cold start through to ready", () => {
+  const port = 5173;
+  let status: RunStatus = "stopped";
+  const feed = (line: string) => (status = reduceStatus(status, line, port));
+
+  feed("[hearth] phase:installing");
+  assert.equal(status, "installing");
+  feed("added 214 packages in 41s");
+  assert.equal(status, "installing", "ordinary output doesn't move the machine");
+  feed("[hearth] phase:starting");
+  assert.equal(status, "starting");
+  feed("  ➜  Local:   http://localhost:5173/");
+  assert.equal(status, "ready");
+  feed("[hearth] dev exited (code 0)");
+  assert.equal(status, "crashed");
+});
+
+test("reduceStatus keeps a port conflict rather than the crash it causes", () => {
+  // vite prints the reason and then exits, and the exit arrives last — so the
+  // naive machine ends on "crashed" and throws away the only actionable part.
+  let status = reduceStatus("starting", "Error: Port 5173 is already in use", 5173);
+  assert.equal(status, "port-conflict");
+  status = reduceStatus(status, "[hearth] dev exited (code 1)", 5173);
+  assert.equal(status, "port-conflict");
+});
+
+test("reduceStatus never reaches ready for a script that isn't a server", () => {
+  // port 0 means `npm run build`, which prints no URL — without the guard it
+  // would sit at "starting" forever waiting for one.
+  const status = reduceStatus("starting", "  ➜  Local:   http://localhost:5173/", 0);
+  assert.equal(status, "starting");
+});
+
+test("phase lines drive the machine and stay out of the log", () => {
+  assert.ok(isPhaseLine("[hearth] phase:installing"));
+  assert.ok(!isPhaseLine("[hearth] dev exited (code 1)"));
+  assert.ok(!isPhaseLine("added 214 packages"));
 });
 
 test("pushEntry collapses a repeating error instead of filling the buffer", () => {
