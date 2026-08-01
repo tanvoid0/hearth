@@ -54,6 +54,24 @@ export function packHistory<T extends { role: string }>(messages: T[], budgetCha
   return [...system, ...kept];
 }
 
+/**
+ * Has the agent stopped getting anywhere?
+ *
+ * `signatures` are one entry per tool call, each combining the call *and* what
+ * it returned. Repetition alone isn't the signal — checking errors four times
+ * across four edits is exactly the loop this app wants — so what counts is the
+ * same call returning the same answer, which means nothing changed between
+ * them. Build plan §10 asks for loop detection alongside the repair cap; the
+ * cap bounds a productive loop, this catches an unproductive one, and without
+ * it a model that can't fix an error burns every remaining iteration retrying
+ * the edit that already failed.
+ */
+export function stalled(signatures: string[], limit = 3): boolean {
+  const last = signatures[signatures.length - 1];
+  if (last === undefined) return false;
+  return signatures.filter((s) => s === last).length >= limit;
+}
+
 // ponytail: chars-per-token estimate, not a tokeniser. 3 is below the usual ~4
 // for code so the guess errs toward underfilling the window, and it has to
 // leave room for the tool definitions and the reply, neither of which is in

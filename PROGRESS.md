@@ -782,6 +782,65 @@ works under `tauri dev` and finds nothing in a packaged app. That reports as
 "unavailable" rather than as a clean project, and the fix is a Tauri resource at
 packaging time — marked in the code.
 
+### P10 · Auto-repair rounds and loop detection
+
+`get_errors` gave the agent eyes; this makes it use them whether it wants to.
+Calling `finish` now re-checks the project, and a finish that doesn't hold up is
+handed the errors and bounced — up to 3 rounds, which is plan §6's number.
+
+- **The repair hangs off `finish`, because that's the claim being tested.** The
+  model saying "done" is the assertion; verifying is checking it. Nothing else
+  in the loop is a claim about the end state.
+- **Only what can be counted honestly counts as blocking.** Type errors and
+  browser-console errors are unambiguous. The dev server's output deliberately
+  has no classifier — that decision is recorded in `devLogTail` and it still
+  holds — so a build error doesn't trigger a repair round on its own. It's still
+  in the report the model is handed, and in practice a build that won't compile
+  shows up as a type error too, so this loses less than it looks.
+- **Loop detection keys on the call *and* its result**, not the call alone.
+  Repetition by itself is the behaviour this app wants: checking errors four
+  times across four edits is the loop. What means something is the same call
+  returning the same answer, because then nothing changed between them — three
+  of those and the turn stops. Without it, a model that can't fix an error
+  spends every remaining iteration retrying the edit that already failed.
+- `MAX_ITERATIONS` went 12 → 15, plan §6's "max ~15": a repair round spends
+  iterations like anything else, and the cap has to leave room for the ones the
+  repair budget allows.
+
+**Measured, and it found the hole in its own design.** Same probe, both models:
+
+| model | trace | repair rounds | heading applied |
+|---|---|---|---|
+| gemma4:latest | `read_file → edit_file → get_errors → edit_file → get_errors → finish` | **0** | yes |
+| llama3.1:8b | `edit_file` → *stops* | **0** | no |
+
+gemma4 needs no repair rounds — it verifies before claiming, which is what the
+prompt asks for, so the cap never engages. That's the shape a working model has.
+
+llama3.1:8b's zero means the opposite, and it's the finding: **it never calls
+`finish` at all.** It makes one blind edit, the edit fails, and it stops
+replying — so a brake bolted to `finish` never fires. The auto-repair round
+cannot rescue a model that abandons the turn instead of finishing it.
+
+So the no-finish exit verifies too, and *reports* rather than repairs. Bouncing
+it would be wrong: a model that stops may be asking the user a question, and
+answering a question with a build log is worse than useless. But a turn that
+changed files and then trailed off is the most common way a weak model fails,
+and the user was otherwise left believing it worked — the transcript now says
+`stopped without finishing — N error(s) still reported`. Gated on having
+actually written something, so a conversational reply doesn't pay for a
+project-wide type check.
+
+The probe mirrors the new `finish` verification rather than only being re-run
+against it — otherwise it would be measuring a loop the app no longer runs. Its
+canned world grew the two flags that need: whether the model has been *told*
+about the error (by `get_errors` or by a bounce, which carry the same
+information) and whether it edited afterwards.
+
+Not in this cut: PLAN/GATHER as explicit phases. Plan §6 calls the PLAN step
+"the biggest quality lever for local models", and it's the remaining half of
+P7 rather than of this phase.
+
 ---
 
 ## Remaining work
@@ -835,12 +894,15 @@ yet.*
       is a felt problem yet; do it when the trim starts cutting something
       someone wanted.
 - [~] **P7 rest** — `run_command` landed (above), so the agent can execute as
-      well as read. Still open: approval gates before writes and commands,
-      explicit PLAN/ACT/VERIFY phases, and mid-request cancellation — today's
-      Stop only takes effect between steps; cancelling an in-flight call needs
-      a cancellation token threaded into the Rust `ollama_chat` command. The
-      allowlist is what stands in for the approval gate for now, and it's a
-      narrower answer than a gate: it can't say yes to a one-off.
+      well as read, and P10 added the VERIFY half of PLAN/ACT/VERIFY. Still
+      open: approval gates before writes and commands, the explicit **PLAN**
+      and GATHER phases — plan §6 calls PLAN "the biggest quality lever for
+      local models", and it's the one structural piece of the pipeline still
+      missing — and mid-request cancellation; today's Stop only takes effect
+      between steps, and cancelling an in-flight call needs a cancellation
+      token threaded into the Rust `ollama_chat` command. The allowlist is what
+      stands in for the approval gate for now, and it's a narrower answer than
+      a gate: it can't say yes to a one-off.
 - [~] **P8 · Diff review** — checkpoint cards and Monaco diff per file landed
       (above), backed by a git repo at `.hearth/git` rather than a snapshot
       store, with whole-checkpoint restore. Still open: accept/reject per hunk
@@ -852,10 +914,11 @@ yet.*
       scaffold gained a `jsconfig.json` and React types, without which a JS
       project reports no diagnostics at all. Still open from plan §4.5: rename
       refactor and find-references, both a request away now the client exists.
-- [~] **P10 · Error feedback loop** — all three sources merged: `get_errors()`
-      now reads type errors, the dev server log and the preview's browser
-      console. Still open: capped auto-repair rounds and loop detection — today
-      the only brake is P7's 12-step cap.
+- [x] **P10 · Error feedback loop** — done (above): all three sources merged
+      into `get_errors()`, `finish` verified and bounced for up to 3 auto-repair
+      rounds, loop detection on repeated (call, result) pairs, and a turn that
+      writes files and then stops without finishing is verified and reported
+      rather than passed off as success.
 
 ### Milestone D — polish
 

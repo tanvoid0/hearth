@@ -61,6 +61,19 @@ export function formatEntry(e: ConsoleEntry): string {
 }
 
 /**
+ * Runtime errors logged since the agent's last write — the console half of
+ * "is this actually done?".
+ *
+ * Distinct messages, not repeats: one error in a render loop arrives thousands
+ * of times and is still one thing to fix. Warnings don't count — React logs
+ * them for things that work — so this is deliberately narrower than what
+ * `consoleTail` shows the model.
+ */
+export function countErrorsSince(entries: ConsoleEntry[], mark = 0): number {
+  return entries.slice(mark).filter((e) => e.text.startsWith("error:")).length;
+}
+
+/**
  * The browser half of `get_errors`. Same honesty rule as `devLogTail`: a
  * disconnected bridge and a clean console both have nothing to report, and a
  * model that can't tell them apart calls a white screen fixed.

@@ -5,6 +5,7 @@ import {
   MAX_CONSOLE_CHARS,
   capLog,
   consoleTail,
+  countErrorsSince,
   devLogTail,
   exitReason,
   formatEntry,
@@ -120,4 +121,19 @@ test("consoleTail tails rather than heads, and counts what it dropped", () => {
   assert.match(out, /95 earlier messages omitted/);
   assert.ok(out.includes("error 99"));
   assert.ok(!out.includes("error 94"));
+});
+
+test("countErrorsSince counts distinct errors after the mark, not warnings or repeats", () => {
+  let entries: ConsoleEntry[] = [];
+  entries = pushEntry(entries, "error: before the edit");
+  const mark = entries.length;
+  entries = pushEntry(entries, "warn: React key warning");
+  entries = pushEntry(entries, "error: Cannot read properties of null");
+  entries = pushEntry(entries, "error: Cannot read properties of null"); // a render loop
+  entries = pushEntry(entries, "error: something else");
+
+  // One repeated error is one thing to fix; the pre-edit error describes code
+  // that has already been replaced.
+  assert.equal(countErrorsSince(entries, mark), 2);
+  assert.equal(countErrorsSince(entries, 0), 3);
 });

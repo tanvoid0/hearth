@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { contextLimits, packHistory, packTab, rebaseTab, trimForStorage, type Tab } from "./session.ts";
+import { contextLimits, packHistory, packTab, rebaseTab, stalled, trimForStorage, type Tab } from "./session.ts";
 
 const tab = (content: string, savedContent: string): Tab => ({
   path: "C:/p/a.ts",
@@ -86,4 +86,25 @@ test("a big file read still leaves the system prompt in place", () => {
     packed.every((m, i) => i === 0 || m.role !== "tool" || packed[i - 1]?.role === "assistant"),
     "trimming must not leave a tool result without its call",
   );
+});
+
+test("a productive check-edit-check loop is not mistaken for a stuck one", () => {
+  // The thing this app wants the agent to do: edit, check, edit, check. The
+  // calls repeat; the *results* don't, because each edit changed something.
+  const productive = [
+    "get_errors:null:2 errors",
+    "edit_file:{}:applied",
+    "get_errors:null:1 error",
+    "edit_file:{}:applied",
+    "get_errors:null:none",
+  ];
+  assert.equal(stalled(productive), false);
+});
+
+test("the same call returning the same answer three times is stuck", () => {
+  const spinning = ["read_file:a:x", "edit_file:e:failed", "read_file:a:x", "edit_file:e:failed", "read_file:a:x"];
+  assert.equal(stalled(spinning), true);
+  // Two of a kind isn't yet a loop — a retry after an unrelated step is normal.
+  assert.equal(stalled(spinning.slice(0, 3)), false);
+  assert.equal(stalled([]), false);
 });

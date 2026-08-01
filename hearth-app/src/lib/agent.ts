@@ -1,10 +1,10 @@
 import { listDir, readTextFile, writeTextFile } from "./fs";
 import { applyEdits, resolveInProject, samePath, type Edit } from "./edit";
 import { chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
-import { contextLimits, packHistory } from "./session";
+import { contextLimits, packHistory, stalled } from "./session";
 import { useHearthStore } from "./store";
 import { useRunner } from "./runner";
-import { consoleTail, devLogTail } from "./runlog";
+import { consoleTail, countErrorsSince, devLogTail } from "./runlog";
 import { hasChecked, useLsp } from "./lsp";
 import { problemTail } from "./problems";
 import { runCommand } from "./terminal";
@@ -115,7 +115,14 @@ export const TOOL_DEFS = [
   },
 ] as const;
 
-const MAX_ITERATIONS = 12;
+/** Build plan §6 puts ACT at "max ~15". The repair rounds below need headroom
+ *  inside it, since a repair spends iterations like anything else. */
+const MAX_ITERATIONS = 15;
+/** How many times a `finish` that doesn't hold up may be bounced back. Plan
+ *  §6: "errors → back into ACT, max 3 auto-repair rounds". */
+const MAX_REPAIR_ROUNDS = 3;
+/** Identical (call, result) pairs before the turn is called stuck. */
+const MAX_IDENTICAL_CALLS = 3;
 /** A cold `npm install` runs for minutes; anything past this is hung, and a
  *  hung command would otherwise hold the whole turn open. */
 const COMMAND_TIMEOUT_SECS = 180;
@@ -246,6 +253,27 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
   }
 }
 
+/**
+ * The VERIFY step of build plan §6, run when the model says it's finished.
+ *
+ * Counts only what can be counted honestly. Type errors and browser-console
+ * errors are unambiguous; the dev server's output deliberately has no
+ * classifier (see `devLogTail`), so a build failure doesn't trigger a repair
+ * round on its own — though it is still in the report the model gets, and in
+ * practice a build that won't compile shows up as a type error too.
+ */
+async function verify(root: string, maxRead: number): Promise<{ blocking: number; report: string }> {
+  const result = await dispatchTool(root, "get_errors", {}, maxRead);
+  const { status, problems } = useLsp.getState();
+  const { consoleAttached, consoleLog, consoleMark } = useRunner.getState();
+  return {
+    blocking:
+      (status === "ok" ? problems.filter((p) => p.severity === "error").length : 0) +
+      (consoleAttached ? countErrorsSince(consoleLog, consoleMark) : 0),
+    report: result.output,
+  };
+}
+
 function summarize(name: string, args: any): string {
   switch (name) {
     case "edit_file":
@@ -297,6 +325,8 @@ export function systemPrompt(root: string, activeFile?: string | null): string {
     "anything it reports and check again before finishing.",
     "Use run_command for anything that needs to actually execute — the test suite, a type check,",
     "a build. Prefer it over asking the user to run something and paste the result back.",
+    "Calling finish re-checks the project: if errors remain you will be handed them and asked to",
+    "keep going, so check and fix before finishing rather than after.",
     activeFile ? `The user currently has ${activeFile} open in the editor.` : "",
   ]
     .filter(Boolean)
@@ -316,6 +346,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
       ? [...opts.history]
       : [{ role: "system", content: systemPrompt(root, opts.activeFile) }];
   messages.push({ role: "user", content: prompt });
+
+  let repairs = 0;
+  /** Whether this turn changed anything on disk — what makes an unfinished
+   *  turn worth verifying rather than just ending. */
+  let wrote = false;
+  /** One entry per tool call: the call and what it returned. See `stalled`. */
+  const signatures: string[] = [];
 
   try {
     for (let i = 0; i < MAX_ITERATIONS; i++) {
@@ -345,11 +382,27 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
 
       const calls: ToolCall[] = reply.tool_calls ?? [];
       if (calls.length === 0) {
+        // Stopping without calling finish is a real exit, not a repair
+        // opportunity: the model may be asking the user something, and bouncing
+        // a question back with a build log would be worse than useless. But a
+        // turn that *changed files* and then trailed off is the most common way
+        // a weak model fails — measured: llama3.1:8b edits once, the edit
+        // fails, and it stops — and the user is otherwise left believing it
+        // worked. Say so rather than repair it. Gated on having written
+        // something, so a conversational reply doesn't pay for a project check.
+        if (wrote) {
+          const verdict = await verify(root, maxRead);
+          if (verdict.blocking > 0) {
+            onEvent({ type: "done", reason: `stopped without finishing — ${verdict.blocking} error(s) still reported` });
+            return messages;
+          }
+        }
         onEvent({ type: "done", reason: "replied" });
         return messages;
       }
 
       let finished = false;
+      let remaining = 0;
       for (const call of calls) {
         const name = call.function.name;
         let args: any = call.function.arguments;
@@ -364,8 +417,28 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
         }
 
         if (name === "finish") {
+          // Don't take its word for it. Declaring victory on a broken build is
+          // the failure mode the probe measures, and the one thing that turns
+          // this from a chat window into something that finishes a job.
+          const verdict = await verify(root, maxRead);
+          if (verdict.blocking > 0 && repairs < MAX_REPAIR_ROUNDS) {
+            repairs++;
+            messages.push({
+              role: "tool",
+              tool_name: name,
+              content: `not finished — ${verdict.blocking} error(s) still reported. Fix them, then call finish again.\n\n${verdict.report}`,
+            });
+            onEvent({
+              type: "tool",
+              label: `finish → ${verdict.blocking} error(s) remain, repair ${repairs}/${MAX_REPAIR_ROUNDS}`,
+              ok: false,
+              detail: verdict.report,
+            });
+            continue; // `finished` stays false, so the loop carries on
+          }
           finished = true;
-          messages.push({ role: "tool", tool_name: name, content: "ok" });
+          remaining = verdict.blocking;
+          messages.push({ role: "tool", tool_name: name, content: "turn finished" });
           if (args?.summary) onEvent({ type: "assistant", content: args.summary });
           continue;
         }
@@ -373,13 +446,33 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
         const result = await dispatchTool(root, name, args, maxRead);
         // Draw the line the next get_errors reports against: console messages
         // logged before this write describe the code the agent just replaced.
-        if (result.ok && (name === "edit_file" || name === "write_file")) useRunner.getState().markConsole();
+        if (result.ok && (name === "edit_file" || name === "write_file")) {
+          wrote = true;
+          useRunner.getState().markConsole();
+        }
         messages.push({ role: "tool", tool_name: name, content: result.output });
         onEvent({ type: "tool", label: summarize(name, args), ok: result.ok, detail: result.output });
+
+        signatures.push(`${name}:${JSON.stringify(args ?? null)}:${result.output}`);
+        if (stalled(signatures, MAX_IDENTICAL_CALLS)) {
+          onEvent({
+            type: "done",
+            reason: `stopped: ${summarize(name, args)} returned the same result ${MAX_IDENTICAL_CALLS} times — nothing is changing`,
+          });
+          return messages;
+        }
       }
 
       if (finished) {
-        onEvent({ type: "done", reason: "finished" });
+        // A repair budget that ran out is not the same as a clean finish, and
+        // the transcript is the only place that difference can show up.
+        onEvent({
+          type: "done",
+          reason:
+            remaining > 0
+              ? `finished, but ${remaining} error(s) still reported after ${repairs} repair round(s)`
+              : "finished",
+        });
         return messages;
       }
     }

@@ -23,7 +23,9 @@ import { applyEdits } from "../../hearth-app/src/lib/edit.ts";
 import { consoleTail, devLogTail } from "../../hearth-app/src/lib/runlog.ts";
 import { problemTail } from "../../hearth-app/src/lib/problems.ts";
 
-const MAX_ITERATIONS = 12;
+const MAX_ITERATIONS = 15;
+// Same cap the app applies to auto-repair rounds (build plan §6).
+const MAX_REPAIR_ROUNDS = 3;
 
 // A real vite transform error, as it appears on the dev server's stdout. Canned
 // rather than provoked: the point is a deterministic broken build to react to,
@@ -58,6 +60,9 @@ export interface ProbeResult {
   checkedAfterEdit: boolean;
   /** And did it check again after repairing, or declare victory blind? */
   rechecked: boolean;
+  /** How many times `finish` was bounced back because the build was still
+   *  broken — the P10 auto-repair rounds. 0 means it verified before saying so. */
+  repairRounds: number;
   /** Ground truth — plenty of models narrate an edit they never landed. */
   headingApplied: boolean;
   /** Whatever it chose to shell out for, verbatim. */
@@ -76,12 +81,24 @@ async function scaffold(): Promise<string> {
 
 export async function probe(model: string): Promise<ProbeResult> {
   const root = await scaffold();
-  // First get_errors reports a broken build, later ones report clean — so the
-  // trace shows whether the model repairs and re-checks, not just whether it
-  // called the tool once.
+  // A small canned world, so the run is deterministic: the build is broken, and
+  // an edit fixes it only once the model has actually been shown the error.
+  // `told` is set by get_errors *and* by a bounced finish — being handed the
+  // error by the repair round is the same information.
+  let told = false;
+  let repaired = false;
   let errorCalls = 0;
+  let repairRounds = 0;
   const commandCalls: string[] = [];
   const trace: string[] = [];
+
+  /** What the app's get_errors returns, through the app's own formatters. */
+  const errorReport = () =>
+    [
+      problemTail("ok", [], root),
+      devLogTail(true, "http://localhost:5173/", repaired ? CLEAN_LOG : BROKEN_LOG),
+      consoleTail(false, []),
+    ].join("\n\n");
 
   async function run(name: string, args: any): Promise<string> {
     const rel = String(args?.path ?? "");
@@ -97,6 +114,7 @@ export async function probe(model: string): Promise<ProbeResult> {
         const { content, failures } = applyEdits(before, args?.edits ?? []);
         if (failures.length) return `edit_file failed, no changes applied:\n${failures.join("\n\n")}`;
         await fs.writeFile(target, content, "utf8");
+        if (told) repaired = true;
         return `applied edit(s) to ${rel}`;
       }
       case "write_file":
@@ -104,7 +122,6 @@ export async function probe(model: string): Promise<ProbeResult> {
         await fs.writeFile(target, args?.content ?? "", "utf8");
         return `created ${rel}`;
       case "get_errors":
-        errorCalls++;
         // All three of the app's sources, through the app's own formatters —
         // the model has to see the shape it will really be handed, or the
         // instruction-following this measures is being measured against a
@@ -112,11 +129,9 @@ export async function probe(model: string): Promise<ProbeResult> {
         // introduces no type error; the dev log is the canned thing to react to,
         // and no preview is attached in a probe, which `consoleTail` says
         // rather than passing off as silence.
-        return [
-          problemTail("ok", [], root),
-          devLogTail(true, "http://localhost:5173/", errorCalls === 1 ? BROKEN_LOG : CLEAN_LOG),
-          consoleTail(false, []),
-        ].join("\n\n");
+        errorCalls++;
+        told = true;
+        return errorReport();
       case "run_command": {
         // The app runs this through Rust, behind an allowlist. Here it only has
         // to be answerable — a model that calls it and gets "unknown tool" back
@@ -168,8 +183,22 @@ export async function probe(model: string): Promise<ProbeResult> {
       }
       trace.push(name === "get_errors" ? `get_errors[${errorCalls + 1}]` : name);
       if (name === "finish") {
+        // Mirrors runAgent's VERIFY step: a finish that doesn't hold up gets
+        // handed the errors and bounced, up to the same cap. Without this the
+        // probe would be measuring a loop the app no longer runs.
+        if (!repaired && repairRounds < MAX_REPAIR_ROUNDS) {
+          repairRounds++;
+          told = true;
+          trace.push(`repair[${repairRounds}]`);
+          messages.push({
+            role: "tool",
+            tool_name: name,
+            content: `not finished — 1 error(s) still reported. Fix them, then call finish again.\n\n${errorReport()}`,
+          });
+          continue;
+        }
         done = true;
-        messages.push({ role: "tool", tool_name: name, content: "ok" });
+        messages.push({ role: "tool", tool_name: name, content: "turn finished" });
         continue;
       }
       messages.push({ role: "tool", tool_name: name, content: await dispatch(name, args) });
@@ -192,6 +221,7 @@ export async function probe(model: string): Promise<ProbeResult> {
     finishedVia,
     checkedAfterEdit: firstEdit >= 0 && trace.slice(firstEdit + 1).some((t) => t.startsWith("get_errors")),
     rechecked: errorCalls >= 2,
+    repairRounds,
     headingApplied: final.includes("<h1>Hearth</h1>"),
     commands: commandCalls,
   };
