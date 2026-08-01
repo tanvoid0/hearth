@@ -92,6 +92,14 @@ export async function changedFiles(root: string, sha: string): Promise<FileChang
   return parseNameStatus((await git(root, "show", "--name-status", "--format=", sha)).stdout);
 }
 
+/** A file as the last checkpoint left it, for comparing against what's in the
+ *  editor now. Empty when the file is newer than any checkpoint, which renders
+ *  as a whole-file addition — which is what it is. */
+export async function committedVersion(root: string, path: string): Promise<string> {
+  const res = await git(root, "show", `HEAD:${path}`);
+  return res.code === 0 ? res.stdout : "";
+}
+
 /** Both sides of one file at a checkpoint. A missing side — a file added by
  *  this commit, or deleted by it — reads back as empty, which is exactly what
  *  the diff view renders as a whole-file addition or deletion. */

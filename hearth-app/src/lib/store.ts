@@ -17,9 +17,11 @@ export interface DiffView {
   label: string;
   original: string;
   modified: string;
-  /** The checkpoint this diff came from — what the per-hunk revert needs to
-   *  ask git for the hunks. */
-  sha: string;
+  /** The checkpoint this diff came from — what the per-hunk revert needs to ask
+   *  git for the hunks. Null for a diff that isn't one commit's change (the
+   *  working file against the last checkpoint), where there are no hunks of a
+   *  commit to reject. */
+  sha: string | null;
 }
 
 interface HearthState {

@@ -43,7 +43,7 @@ function sameFile(a: string, b: string): boolean {
  * it would mean tracking its scroll. The list is also the only place that can
  * say a hunk has already been put back.
  */
-function HunkStrip({ diff, root }: { diff: DiffView; root: string }) {
+function HunkStrip({ diff, root }: { diff: DiffView & { sha: string }; root: string }) {
   const [hunks, setHunks] = useState<Hunk[] | null>(null);
   const [reverted, setReverted] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
@@ -212,7 +212,7 @@ export function EditorPane() {
             ✕
           </button>
         </div>
-        {projectRoot && <HunkStrip diff={diff} root={projectRoot} />}
+        {projectRoot && diff.sha && <HunkStrip diff={{ ...diff, sha: diff.sha }} root={projectRoot} />}
         <div className="min-h-0 flex-1">
           <DiffEditor
             original={diff.original}

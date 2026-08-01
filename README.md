@@ -9,7 +9,7 @@ Two things live here today:
 
 | | what it is | status |
 |---|---|---|
-| [`hearth-app/`](hearth-app) | the Tauri + React desktop app — file tree, Monaco tabs, terminal, dev server, preview, type checking, and an agent that edits the open project | through P9; P3/P4 partial |
+| [`hearth-app/`](hearth-app) | the Tauri + React desktop app — file tree, Monaco tabs, terminal, dev server, preview, type checking, and an agent that edits the open project | P0–P14 landed |
 | [`p0-spike/`](p0-spike) | headless harness that scores a local model on a multi-step tool loop | P0 done |
 
 ## Prerequisites
@@ -32,6 +32,13 @@ cd hearth-app && npm install && npm run tauri dev
 First run compiles the Rust side and takes a few minutes; later runs are
 seconds. Hit **Open Folder**, click a file, edit, **Ctrl+S** to save. The open
 folder, tabs and unsaved drafts come back on the next launch.
+
+**Run** starts any script in the project's `package.json` — the package manager
+comes from the lockfile — and the preview pane shows the result with a URL bar,
+viewport presets and the dev server's log. The bottom dock holds Problems,
+Outline (or find-references, after Shift+F12), History, Project (`.env` and
+dependencies) and the Terminal. **Ctrl+K** in the editor rewrites the selection
+from an instruction, and **Ctrl+Shift+P** opens the command palette.
 
 ## Code with the model
 
@@ -58,12 +65,22 @@ The agent checks its own work rather than waiting to be told what broke.
 server's build output, and the running page's browser console — so a
 misspelled `onclick`, which compiles and logs nothing, is caught alongside a
 crash. It can also run the project's own tooling (`npm test`, `npx tsc
---noEmit`) through an allowlist. Every turn that changes a file becomes a
-checkpoint you can diff and roll back.
+--noEmit`) through an allowlist, and find its way around with `search` and
+`repo_map` rather than reading files one at a time. Every turn that changes a
+file becomes a checkpoint you can diff, reject a hunk of, or roll back — from
+the transcript or from the History tab, which outlives the chat.
 
-Not there yet: no approval prompt before a write (there are checkpoints
-instead), and **Stop** ends the run after the current step rather than
-interrupting it.
+Two switches under the composer. **Plan** (on by default) buys one extra call
+per turn for a numbered plan before anything is touched, which is the biggest
+single quality difference for a local model. **Ask first** (off by default)
+shows every file write and every command — the change itself, not the tool's
+name — and waits. It's off because checkpoints already make every turn
+reversible. **Stop** aborts the call in flight, not just the next step.
+
+`.env` files are redacted before the agent ever sees them: it gets the keys and
+the value lengths, never the values. That's less about trusting the model than
+about where a reply ends up — the transcript is stored and replayed as history
+on every later turn.
 
 ```bash
 cd hearth-app && npm test

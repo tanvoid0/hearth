@@ -15,6 +15,7 @@ import { ProjectPanel } from "./components/ProjectPanel";
 import { CommandPalette, type PaletteCommand } from "./components/CommandPalette";
 import { useRunner } from "./lib/runner";
 import { useLsp } from "./lib/lsp";
+import { committedVersion } from "./lib/git";
 
 /** The bottom dock holds one thing at a time (build plan §3). */
 type Dock = "terminal" | "problems" | "outline" | "history" | "project" | null;
@@ -61,6 +62,26 @@ function App() {
     if (folder) await openFolder(folder);
   }
 
+  // The diff half of P1's deferred split/diff view, against the thing there's
+  // actually a question about: has this file changed since the agent's last
+  // turn, and how. Compares the editor buffer, not the file on disk, so it
+  // answers that before you save as well as after.
+  async function compareWithCheckpoint() {
+    const { activePath, tabs, openDiff } = useHearthStore.getState();
+    const tab = tabs.find((t) => t.path === activePath);
+    if (!tab || !projectRoot) return;
+    const base = projectRoot.replace(/\\/g, "/");
+    const rel = tab.path.replace(/\\/g, "/").slice(base.length + 1);
+    openDiff({
+      path: rel,
+      label: "last checkpoint → now",
+      original: await committedVersion(projectRoot, rel),
+      modified: tab.content,
+      // Not one commit's change, so there are no hunks of a commit to reject.
+      sha: null,
+    });
+  }
+
   function handleBackToProjects() {
     const dirty = useHearthStore.getState().tabs.filter((t) => t.content !== t.savedContent);
     if (dirty.length > 0 && !confirm(`${dirty.length} unsaved file(s) will be discarded. Leave anyway?`)) return;
@@ -91,6 +112,7 @@ function App() {
         if (activePath) void saveTab(activePath);
       } },
       { label: "Open folder…", run: () => void handleOpenFolder() },
+      { label: "Compare with last checkpoint", run: () => void compareWithCheckpoint() },
       ...DOCK_TABS.map((tab) => ({ label: `Toggle ${tab.label.toLowerCase()}`, run: () => toggleDock(tab.key) })),
       { label: "Toggle preview", run: () => setPreviewOpen((v) => !v) },
       { label: "Toggle agent panel", run: () => setChatOpen((v) => !v) },

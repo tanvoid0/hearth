@@ -843,96 +843,299 @@ P7 rather than of this phase.
 
 ---
 
+### P3 · Runner, finished
+
+npm was hardcoded and so was `dev`. Both are now read from the project.
+
+The package manager comes from the **lockfile**, not from a preference or a
+`packageManager` field. That's the file that decides whether the install the
+user already did counts: running `npm install` in a pnpm project doesn't just
+pick the wrong tool, it writes a second lockfile and a `node_modules` layout
+the project's own scripts don't expect. npm is the fallback because every Node
+install has one.
+
+Any script in `package.json` can be started, and the port flags only go on when
+the script is actually a vite dev server — `--port --strictPort` handed to `npm
+run build` is an error, and a build script parked at "starting" waits forever
+for a URL nothing will print. The check is the script's command text, which is
+also what decides whether the generated bridge config gets passed.
+
+Run state is a machine rather than a boolean:
+`stopped/installing/starting/ready/crashed/port-conflict`. The distinction that
+earns it is **installing vs starting**: a cold install runs for minutes with no
+output a user reads as progress, and "starting…" over the top of it is what
+makes a working app look hung. Rust emits `[hearth] phase:*` lines for the two
+it can tell apart; everything else the frontend derives from the output it was
+already parsing. A port conflict keeps its own state rather than being
+overwritten by the exit it causes, because it's the one failure that pressing
+Run again fixes — the port is allocated fresh each time.
+
+The agent sees the same states. `crashed` and `stopped` both used to arrive as
+"dev server not running", which reads as *nobody pressed Run* — so a server the
+agent's own edit had just killed looked like one that was never up.
+
+### P4 · Browser, finished
+
+- **URL bar** over the path only. The origin is the runner's and changes every
+  run, so it isn't the user's to type. There's no reading back where the page
+  navigated itself to — the iframe is a different origin, and that's the same
+  wall every other item here ran into.
+- **Viewport presets** as widths (375/768/1280). No device frame: the height is
+  whatever the pane has, and a letterboxed phone outline costs vertical space to
+  say nothing.
+- **Network capture** in the bridge, reported as `net` rather than `error`. A
+  404 from an API the user doesn't control is not the agent's bug to fix, and
+  counting it as one would spend every auto-repair round on somebody else's
+  server. No timing in the text, so a poll collapses into one line with a count
+  instead of filling the buffer.
+- **The bridge for projects Hearth didn't scaffold**, which was the real gap.
+  Hearth writes `.hearth/vite.hearth.mjs` before each run — a config that finds
+  the project's own with `loadConfigFromFile` and merges a `transformIndexHtml`
+  plugin into it. The alternative was writing the snippet into the user's
+  `index.html`, which is a change to their repo they didn't ask for and would
+  have to keep deleting. Regenerated every run so it can't go stale against the
+  bridge source, and it can't find itself because `.hearth/` isn't a name vite
+  searches. Still vite-only: a Next or webpack project runs fine and
+  `consoleTail` still says the bridge isn't connected.
+
+### P11 · Search and the repo map
+
+Two ways to find things without reading files one at a time.
+
+`search` walks the tree in Rust — literal, case-insensitive, skipping the same
+directories the file tree does. Deliberately not ripgrep: the binary isn't
+something an offline-first app can assume is installed, and a regex crate is a
+dependency for a feature whose job is finding a name someone already knows how
+to spell. Regex is the upgrade path if literal search turns out not to be
+enough.
+
+`repo_map` lists exported symbols per file, by regex rather than by asking
+tsserver. That's the surprising half, and it's a deliberate trade: the map
+covers every source file, and asking the language server would mean opening all
+of them — a cold project-wide load taking tens of seconds, holding every file in
+memory afterwards, to answer a question that doesn't need types. The map says
+what exists and roughly where; the agent reads the file when it needs to be
+right.
+
+### P7 · PLAN, approval gates, and cancellation that works
+
+**PLAN** is one tool-free call before the loop. Tool-free is the point: a model
+handed tools uses them, and what's wanted here is the thinking that otherwise
+happens one tool call at a time and gets re-derived from scratch every time the
+context window trims. Plan §6 calls it the biggest quality lever for local
+models; it costs one extra call per turn, which is why it's a switch (default
+on) rather than a law.
+
+**Approval gates** show the change itself — the search/replace pairs, the file
+content, the command — not the tool's name, because a gate that only names the
+tool is one you learn to click through. Reads aren't gated: a prompt on every
+`read_file` is a prompt nobody reads by the third turn, and reads are what a
+model has to do a lot of to be any good. Refusing one call doesn't end the turn;
+the model is told no and decides what to do instead, which is what makes it
+different from Stop. A refusal counts toward loop detection, so a model that
+asks three times gets stopped rather than asking forever. Default off, because
+checkpoints already make every turn reversible.
+
+**Stop** now aborts the call in flight. A flag checked between steps was no help
+in the case Stop exists for: the longest wait in a turn is the one *before* the
+first token, while Ollama loads a model, and on a model that spilled to CPU
+that's minutes. The Rust side selects over a cancel channel, so the request
+future is dropped and the connection closed — Ollama stops generating rather
+than generating into a void.
+
+### P8 · Reject per hunk, and seeing what the agent wrote
+
+Rejecting a hunk goes through `applyEdits` — the agent's own search/replace
+matcher — rather than applying a patch by line number. The hunk parser
+reassembles both whole sides including context, which turns a revert into
+`{ search: after, replace: before }`. It inherits the whitespace tolerance and,
+more importantly, the refusal to fuzzy-apply: if the file moved on since the
+checkpoint, the revert fails loudly instead of putting the wrong lines back.
+There's no second patch-application path to keep correct.
+
+It edits the working file, not the commit. The checkpoint is history and stays
+as it is; what's being asked is "keep the turn, minus this part".
+
+Lines the agent wrote are marked in the editor until you type there yourself.
+The span is computed by trimming the common prefix and suffix rather than
+running a real diff — for a decoration, the honest answer to "which lines" is
+the span that changed.
+
+### P9 · Rename and find-references
+
+Both ran into the same wall from opposite sides: **Monaco can only edit, and can
+only display, models it holds** — which here means open tabs.
+
+For rename that would mean renaming the symbol in the two files you happen to be
+looking at and quietly leaving the rest of the project on the old name, which is
+worse than no rename at all. Files that aren't open are rewritten on disk, spans
+applied last-first so the earlier ones keep their offsets.
+
+For references it would mean showing the ones in open tabs and omitting every
+other one — the wrong half of the answer, since references in a file you haven't
+opened are exactly the ones worth finding. So Monaco's reference provider stays
+off and Shift+F12 is an editor action that fills a dock panel instead. That
+panel doubles as the symbol outline, which closes P1's last deferral: both are a
+list of places to jump to and differ only in how the list was chosen.
+
+### P13 · The checkpoint timeline
+
+`.hearth/git` has held every turn since P8; what was missing was any way to
+reach one that wasn't the card in the transcript. Clearing the chat hid history
+git still had, and a previous session's turns were unreachable entirely. The
+History tab reads the log directly — expand a checkpoint for its files, click
+one for the diff, Restore to roll the tree back.
+
+Not the staging/branching UI §13 also lists. That surface is the **user's** repo,
+not Hearth's checkpoint repo, and putting both behind one "Source control" tab
+makes it very easy to reset the wrong one.
+
+### P12 · Inline edit and the element picker
+
+Ctrl+K rewrites the selection, or the current line when there's no selection.
+One tool-free call, not an agent turn: the loop exists to find things and check
+its own work, and neither applies when the user has already pointed at the code
+and is watching the result land. Nothing is written to disk — the replacement
+goes into the editor buffer, so Ctrl+Z undoes it and it only reaches the file on
+save, which is also why it needs no approval gate. The reply is unfenced before
+it's pasted: models fence code whatever the instruction says, and a stray ```` ``` ````
+in the middle of a source file is the worst failure available here.
+
+The element picker lives in the console bridge, for the same reason the console
+patch does — the iframe is a different origin, so the parent can't attach a
+listener to the page. Capture-phase listeners, so a button's own `onClick`
+doesn't fire and navigate away from the thing being pointed at. What you click
+goes into the composer rather than straight to the agent: the element is the
+subject of a request, not the request.
+
+Not built: **FIM completion**. It needs per-model prompt templates and a
+mid-typing latency budget a local model doesn't have, and nothing else in the
+phase depends on it.
+
+### P14 · Templates, secrets, dependencies
+
+The `.env` work has two halves and the invisible one matters more. `read_file
+.env` handed the model every key the project has — and that reply goes into the
+transcript, which is written to `localStorage` and sent back as history on every
+subsequent turn. Reads and search hits from a `.env` file are now redacted to
+keys and value lengths. Keys are kept deliberately: the agent legitimately needs
+to know which variables exist, and answering with nothing sends it guessing at
+names. Committed `.env.example` files are left alone, since placeholders are the
+only thing they exist to show.
+
+The panel is the visible half — values masked until asked for, editable in
+place. A write changes one line and leaves comments and ordering alone;
+rebuilding the file from parsed entries would be shorter and would silently
+delete every comment in it. Short values are blanked entirely rather than
+half-shown, because four characters of an eight-character secret is most of a
+secret.
+
+The dependency list shares that tab. Both answer the same question from two
+sides — what is this project wired up to — and a panel per list is how a bottom
+dock ends up with eight tabs nobody can find anything in.
+
+A **vanilla template** alongside the React one: same runner, preview and type
+checking, with nothing between the file and the page. Two, not ten — a starter
+nobody picks is a starter nobody maintains, and the agent's first job on any of
+them is to replace most of it anyway.
+
+---
+
 ## Remaining work
 
-Following the build plan's phase order (§8). Each phase should land as a
-usable increment, not a partial cut.
+Following the build plan's phase order (§8).
+
+Every phase P0–P14 has now landed at least once. What follows is what each one
+deliberately doesn't have, and why — the list is short, and the entries are
+decisions rather than backlog.
 
 ### Milestone A — finish the local IDE (no AI)
 
-- [x] **P2 · Terminal** — done (above): PTY-backed shell, tabs, per-project
-      cwd, shell detection, scrollback search, tree-kill teardown, and a
-      session manager keyed by id so the agent's separate PTY is a second key
-      rather than a rewrite.
-- [~] **P3 · Runner** — port allocation, install-on-demand and clean Windows
-      teardown landed with the Run + Preview slice above. Still open:
-      package-manager detection (npm is hardcoded), running arbitrary scripts
-      rather than just `dev`, and the full health-state machine
-      (`stopped/installing/starting/ready/crashed/port-conflict`).
-- [~] **P4 · Browser** — the preview `<iframe>` landed with that same slice,
-      and the console-capture bridge with the `get_errors` work above. Still
-      open: URL bar, viewport presets, network panel, and the bridge for
-      projects Hearth didn't scaffold. Element picker explicitly deferred to
-      P12.
+- [x] **P2 · Terminal** — PTY-backed shell, tabs, per-project cwd, shell
+      detection, scrollback search, tree-kill teardown, and a session manager
+      keyed by id so the agent's separate PTY is a second key rather than a
+      rewrite.
+- [x] **P3 · Runner** — done (above).
+- [x] **P4 · Browser** — done (above), except that the injected bridge is
+      vite-only. A Next or webpack project runs and previews fine; it just has
+      no console capture, which `consoleTail` reports rather than passing off as
+      silence. Wire those up when a non-vite project is the thing someone is
+      actually working on.
 
-*End state: a usable local IDE — edit, run, preview — with no AI involved
-yet.*
+*End state: a usable local IDE — edit, run, preview — with no AI involved.*
 
 ### Milestone B — local models
 
-- [x] **P5 · Model manager** — done; see the P5 sections above and the "finish
-      what the agent panel started" list below.
-- [~] **P6 · Chat** — streaming chat against the loaded model landed with the
-      agent panel. Still open: markdown/code rendering and conversation
-      persistence — see **P6 rest** below.
-
-### Milestone B/C — finish what the agent panel started
-
 - [x] **P5 · Model manager** — list, pull-with-progress, unload, `num_ctx`
-      control, GPU-split badge and total-VRAM readout all landed (above).
-      "Be honest when a model won't fit" is served by measurement rather than
-      prediction; the pre-load warning the plan asks for is **deliberately not
-      built**, because the footprint input it needs doesn't exist (see the
-      0.35×–1.21× table). Explicit load is the one omission — selecting a model
-      and sending loads it, and a button to do the same thing 20 seconds
-      earlier isn't worth its own control.
-- [~] **P6 rest** — code-block and inline-code rendering landed (above). Still
-      open: conversation persistence via `tauri-plugin-sql`. Worth questioning
-      rather than just doing — transcripts already survive restarts in
-      `localStorage`, keyed per project and trimmed to a 200k-char budget, so
-      SQLite buys unbounded history and queryability across projects. Neither
-      is a felt problem yet; do it when the trim starts cutting something
-      someone wanted.
-- [~] **P7 rest** — `run_command` landed (above), so the agent can execute as
-      well as read, and P10 added the VERIFY half of PLAN/ACT/VERIFY. Still
-      open: approval gates before writes and commands, the explicit **PLAN**
-      and GATHER phases — plan §6 calls PLAN "the biggest quality lever for
-      local models", and it's the one structural piece of the pipeline still
-      missing — and mid-request cancellation; today's Stop only takes effect
-      between steps, and cancelling an in-flight call needs a cancellation
-      token threaded into the Rust `ollama_chat` command. The allowlist is what
-      stands in for the approval gate for now, and it's a narrower answer than
-      a gate: it can't say yes to a one-off.
-- [~] **P8 · Diff review** — checkpoint cards and Monaco diff per file landed
-      (above), backed by a git repo at `.hearth/git` rather than a snapshot
-      store, with whole-checkpoint restore. Still open: accept/reject per hunk
-      and editor decorations during agent writes.
-- [x] **P9 · LSP + Problems** — done (above): a `tsserver` sidecar rather than
+      control, GPU-split badge and total-VRAM readout (above). "Be honest when a
+      model won't fit" is served by measurement rather than prediction; the
+      pre-load warning the plan asks for is **deliberately not built**, because
+      the footprint input it needs doesn't exist (see the 0.35×–1.21× table).
+      Explicit load is the one omission — selecting a model and sending loads
+      it, and a button to do the same thing 20 seconds earlier isn't worth its
+      own control.
+- [x] **P6 · Chat** — streaming chat, code-block and inline-code rendering, and
+      transcripts that survive a restart, kept per project.
+- [~] **P6 · conversation persistence via `tauri-plugin-sql`** — the one item
+      still genuinely open, and it stays open on purpose. Transcripts already
+      survive restarts in `localStorage`, keyed per project and trimmed to a
+      200k-char budget. SQLite buys unbounded history and queryability across
+      projects; neither is a felt problem yet. Do it when the trim starts
+      cutting something someone wanted — which is a thing that can be noticed
+      rather than predicted.
+
+### Milestone C — the agent
+
+- [x] **P7 · Agent loop** — tools, `run_command`, PLAN/ACT/VERIFY, approval
+      gates, and mid-request cancellation (above). GATHER never became a phase
+      of its own: `search` and `repo_map` are what it would have done, and
+      they're more useful as tools the model reaches for than as a step every
+      turn pays for.
+- [x] **P8 · Diff review** — checkpoint cards, Monaco diff per file,
+      whole-checkpoint restore, reject-per-hunk, and editor decorations for the
+      agent's writes.
+- [x] **P9 · LSP + Problems** — a `tsserver` sidecar rather than
       `typescript-language-server` (it wraps the same process, and `typescript`
-      was already a dependency), diagnostics into Monaco and a Problems panel,
-      hover, go-to-definition, and document symbols behind Ctrl+Shift+O. The
-      scaffold gained a `jsconfig.json` and React types, without which a JS
-      project reports no diagnostics at all. Still open from plan §4.5: rename
-      refactor and find-references, both a request away now the client exists.
-- [x] **P10 · Error feedback loop** — done (above): all three sources merged
-      into `get_errors()`, `finish` verified and bounced for up to 3 auto-repair
+      was already a dependency here), diagnostics into Monaco and a Problems
+      panel, hover, go-to-definition, document symbols, rename, and
+      find-references. The scaffold gained a `jsconfig.json` and React types,
+      without which a JS project reports no diagnostics at all.
+- [x] **P10 · Error feedback loop** — all three sources merged into
+      `get_errors()`, `finish` verified and bounced for up to 3 auto-repair
       rounds, loop detection on repeated (call, result) pairs, and a turn that
       writes files and then stops without finishing is verified and reported
       rather than passed off as success.
 
 ### Milestone D — polish
 
-- [ ] **P11 · Codebase context** — repo map from LSP/tree-sitter symbols,
-      ripgrep search tool.
-- [ ] **P12 · Inline edit, FIM, element picker.**
-- [ ] **P13 · Source control panel** — staging, hunks, branches, commit UI,
-      checkpoint timeline. The checkpoint repo P8 built is what the timeline
-      reads from; today the cards live only in the transcript, so clearing the
-      chat hides history that git still has.
-- [ ] **P14 · Templates, secrets, export** — the starter-scaffold half landed
-      early with the prompt-first home (one Vite React template). Still open:
-      more templates, `.env` manager with redaction, dependency panel, GitHub
-      push, deploy hook.
+- [x] **P11 · Codebase context** — `search` and `repo_map` (above).
+- [x] **P12 · Inline edit and element picker** — done (above). **FIM is not
+      built**: it needs per-model prompt templates and a mid-typing latency
+      budget a local model doesn't have, and nothing else depends on it.
+- [x] **P13 · Checkpoint timeline** — done (above). **Staging, branches and a
+      commit UI are not built**, and that's a scope decision rather than a
+      deferral: those act on the *user's* repo, while everything else here acts
+      on `.hearth/git`. One panel driving both is how someone resets the wrong
+      one. If they get built, they belong somewhere that never shares a button
+      with a checkpoint.
+- [x] **P14 · Templates and secrets** — two templates, `.env` redaction on both
+      sides, and a dependency list (above). **GitHub push and the deploy hook
+      are not built**: both are outward-facing actions needing credentials
+      Hearth has nowhere to keep, in an app whose selling point is that nothing
+      leaves the machine. The terminal is next door, and `git push` works there
+      with the user's own credentials and the user's own decision.
+
+### Not a phase, but still open
+
+- **Split editor.** P1's deferred "split/diff view" is half done: the diff half
+  is a palette command comparing the open buffer against the last checkpoint,
+  which is the question people actually have (what did the agent change here).
+  A real side-by-side split needs two active paths and a tab bar per pane, in a
+  main area already time-shared between editor, diff and preview. Worth doing
+  when the pane stops being the scarce thing.
+- **Find/replace** was on the same deferred list and turns out to need nothing:
+  Monaco's own Ctrl+F and Ctrl+H work, and the widget is better than anything
+  worth writing here.
 
 ---
 
@@ -974,13 +1177,20 @@ they don't get silently decided by momentum.
    and gemma4 runs the full edit→check→fix→re-check loop with it (see above).
    Closed — but it moved the open question into item 1 rather than removing
    it, since llama3.1:8b ignores the tool entirely.
-4. **~~P1 scope-creep candidates.~~** Command palette is done (see above), a
-   phase later than this item suggested. Still open from P1's deferred list:
-   split/diff view, and find/replace in the editor. Breadcrumbs and symbol
-   outline were being held for P9's LSP, which now exists — the document-symbol
-   provider behind Ctrl+Shift+O is already fed by `navtree`, so what's left is
-   somewhere to render it rather than anything to compute. The bottom dock is
-   the obvious place, and it grew a tab strip with the Problems panel.
+4. **~~P1 scope-creep candidates.~~** Closed. The command palette landed a
+   phase later than this item suggested; the symbol outline got the dock tab it
+   was waiting for; find/replace turned out to need nothing, since Monaco's own
+   Ctrl+F and Ctrl+H are better than anything worth writing. Only the split
+   editor is left, and it's parked for a reason rather than forgotten — see
+   "Not a phase, but still open" above.
+
+5. **What the agent does with the tools it just grew.** `search`, `repo_map`
+   and PLAN all landed together, and all three change what a turn costs and how
+   it goes wrong — PLAN adds a call, `repo_map` can return a few hundred lines,
+   and a model that reaches for `search` instead of reading three files spends
+   its context differently. The tool-probe measures one thing (does it check its
+   own work) and won't see any of that. Worth a second probe task on an
+   unfamiliar multi-file project before assuming the additions are free.
 
 ---
 
@@ -1012,15 +1222,17 @@ cd hearth-app && npm run tauri dev
 ```
 
 ```bash
-# Unit tests: path safety, search/replace, session packing, context sizing,
-# dev-log parsing, pull progress, fenced-code splitting, checkpoint name-status,
-# diagnostic folding — plus one that drives a real tsserver end to end
+# Unit tests (97): path safety, search/replace, session packing, context
+# sizing, run-state machine, dev-log parsing, pull progress, fenced-code
+# splitting, checkpoint name-status, hunk parsing, repo-map extraction, .env
+# redaction, diagnostic folding — plus one that drives a real tsserver end to end
 cd hearth-app && npm test
 ```
 
 ```bash
-# Rust tests: NDJSON, PTY and Content-Length framing, a real shell in a real
-# PTY, a real tsserver reporting a real type error, and the whole checkpoint
-# sequence against a real git repo
+# Rust tests (18): NDJSON, PTY and Content-Length framing, package-manager
+# detection, project search, the command allowlist, a real shell in a real PTY,
+# a real tsserver reporting a real type error, and the whole checkpoint sequence
+# against a real git repo
 cd hearth-app/src-tauri && cargo test --no-default-features
 ```
