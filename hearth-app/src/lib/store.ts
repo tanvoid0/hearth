@@ -7,6 +7,7 @@ import type { TemplateKind } from "./workspace";
 import { packTab, rebaseTab, type Tab } from "./session";
 import { useRunner } from "./runner";
 import { useLsp } from "./lsp";
+import { useChatStore } from "./chat";
 
 export type { Tab };
 
@@ -40,6 +41,11 @@ interface HearthState {
   composer: string;
   /** Takes over the editor pane while a checkpoint file is under review. */
   diff: DiffView | null;
+  /** The file pinned in a second editor beside the main one, or null for no
+   *  split. One extra path rather than a second tab bar: the split exists to
+   *  keep one file in view while you move around in the other, and a pane with
+   *  its own tabs is a second editor to keep in step rather than a view. */
+  splitPath: string | null;
   /** Lines the agent last wrote, by file, for the editor decoration. A change
    *  you didn't type is otherwise invisible until you go looking for it. Not
    *  persisted: it describes what just happened, not the session. */
@@ -64,6 +70,7 @@ interface HearthState {
   rehydrateFromDisk: () => Promise<void>;
   openDiff: (diff: DiffView) => void;
   closeDiff: () => void;
+  setSplit: (path: string | null) => void;
   markAgentWrite: (path: string, lines: number[]) => void;
 }
 
@@ -82,6 +89,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
   pendingPrompt: null,
   composer: "",
   diff: null,
+  splitPath: null,
   agentLines: {},
 
   // Every way in and out of a project routes through openFolder/closeProject,
@@ -89,6 +97,11 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
   // against the previous project would keep serving it under the new one's name.
   openFolder: async (root: string) => {
     await useRunner.getState().stop();
+    // Transcripts live in the project now, so switching projects has to read
+    // one rather than look up a key. Before the tree loads: the panel renders
+    // as soon as `projectRoot` is set, and an empty chat that fills in a beat
+    // later reads as a conversation that was lost.
+    await useChatStore.getState().hydrate(root);
     // Returns as soon as the process is spawned — tsserver then spends a second
     // or two loading the compiler, which nothing here has to wait for.
     await useLsp.getState().start(root);
@@ -100,6 +113,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
       tabs: [],
       activePath: null,
       diff: null,
+      splitPath: null,
       agentLines: {},
     });
   },
@@ -122,6 +136,7 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
       tabs: [],
       activePath: null,
       diff: null,
+      splitPath: null,
       agentLines: {},
     });
   },
@@ -232,7 +247,9 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
       const fallback = nextTabs[idx - 1] ?? nextTabs[0];
       nextActive = fallback ? fallback.path : null;
     }
-    set({ tabs: nextTabs, activePath: nextActive });
+    // A split pinned to the file just closed would show a tab that no longer
+    // exists; closing it is what the user did.
+    set({ tabs: nextTabs, activePath: nextActive, ...(get().splitPath === path ? { splitPath: null } : {}) });
   },
 
   // Runs once after the persisted session is read back. localStorage only holds
@@ -276,8 +293,11 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
 
     // Reopening the app lands here instead of in `openFolder`, so without this
     // a restored session would have no language server at all — no squiggles,
-    // no hover, and an agent told there are no type errors.
+    // no hover, and an agent told there are no type errors. The transcript is
+    // read here for the same reason: it lives in the project now, and a restart
+    // that skipped this would show an empty chat for a project that has one.
     await useLsp.getState().start(projectRoot);
+    await useChatStore.getState().hydrate(projectRoot);
     for (const tab of liveTabs) useLsp.getState().touch(tab.path, tab.content);
 
     set({
@@ -290,6 +310,8 @@ export const useHearthStore = create<HearthState>()(persist((set, get) => ({
 
   openDiff: (diff: DiffView) => set({ diff }),
   closeDiff: () => set({ diff: null }),
+
+  setSplit: (path) => set({ splitPath: path }),
 }), {
   name: "hearth-session",
   // ponytail: writes on every keystroke (setTabContent). Fine for normal

@@ -55,6 +55,25 @@ test("packHistory keeps the system prompt and drops orphaned tool results", () =
   assert.deepEqual(packed.at(-1), { role: "user", content: "next" });
 });
 
+test("a turn interrupted mid-flight comes back resumable, and out of history", () => {
+  // What a reload has to survive: the turn's prompt, the tool results it had
+  // already collected, and the id of the model call the dead page orphaned.
+  const partial = [
+    { role: "system", content: "you are working in C:/proj" },
+    { role: "user", content: "rename the button" },
+    { role: "assistant", content: "reading" },
+    { role: "tool", content: "c".repeat(400) },
+  ];
+  // 500 is small enough to force a trim, as a long turn eventually does.
+  const packed = packHistory(partial, 500);
+
+  assert.equal(packed[0].role, "system", "resuming needs the system prompt as much as a new turn does");
+  assert.ok(
+    packed.every((m, i) => i === 0 || m.role !== "tool" || packed[i - 1]?.role === "assistant"),
+    "a trimmed resume must not open on a tool result whose call went with it",
+  );
+});
+
 test("contextLimits keeps one file read to half the window", () => {
   // The guard is against a single read_file being larger than the context it
   // has to fit in — at which point Ollama truncates from the front and the

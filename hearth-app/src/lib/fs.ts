@@ -25,6 +25,12 @@ export function writeTextFile(path: string, contents: string): Promise<void> {
   return invoke("write_text_file", { path, contents });
 }
 
+/** Append rather than rewrite — see `transcript.ts` for why the chat log needs
+ *  one and the rest of the app doesn't. */
+export function appendTextFile(path: string, contents: string): Promise<void> {
+  return invoke("append_text_file", { path, contents });
+}
+
 export interface SearchHit {
   /** Relative to the project root, forward slashes. */
   path: string;
