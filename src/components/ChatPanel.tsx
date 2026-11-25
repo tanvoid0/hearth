@@ -6,6 +6,8 @@ import type { ChatMessage } from "../lib/ollama";
 import { pullPercent, type PullState } from "../lib/pull";
 import { changedFiles, commitAll, ensureRepo, fileVersions, restore } from "../lib/git";
 import { changeLabel, type FileChange } from "../lib/gitdiff";
+import type { TurnStats } from "../lib/session";
+import { stopCommand } from "../lib/terminal";
 import { RichText } from "./RichText";
 import {
   cancelChat,
@@ -133,6 +135,17 @@ function ThinkingFlame() {
   );
 }
 
+/** `5 calls · 1,240 tok · 38 tok/s`. Rounded to whole tokens a second: the
+ *  decision it feeds is "keep waiting or pick a smaller model", and nothing
+ *  below the decimal point moves that either way. */
+function statLine(s: TurnStats): string {
+  return [
+    `${s.calls} call${s.calls === 1 ? "" : "s"}`,
+    `${s.outTokens.toLocaleString()} tok`,
+    `${s.tokensPerSec.toFixed(0)} tok/s`,
+  ].join(" · ");
+}
+
 function ToolRow({ entry }: { entry: Extract<Entry, { kind: "tool" }> }) {
   const [open, setOpen] = useState(false);
   return (
@@ -142,7 +155,13 @@ function ToolRow({ entry }: { entry: Extract<Entry, { kind: "tool" }> }) {
         className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left font-mono text-neutral-400 hover:bg-neutral-800"
       >
         <span className={entry.ok ? "text-emerald-500" : "text-red-400"}>{entry.ok ? "✓" : "✗"}</span>
-        <span className="truncate">{entry.label}</span>
+        <span className="min-w-0 truncate">{entry.label}</span>
+        {/* Why it failed, without having to open it. `run_command` puts the
+            whole story on that first line — "timed out after 180s and was
+            killed" is the difference between a broken build and a hung one. */}
+        {!entry.ok && (
+          <span className="min-w-0 truncate text-neutral-600">· {entry.detail.split("\n")[0]}</span>
+        )}
       </button>
       {open && (
         <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-900 p-2 text-[11px] text-neutral-400">
@@ -263,6 +282,13 @@ export function ChatPanel() {
   // bad edit and a lost afternoon.
   const [askFirst, setAskFirst] = useState(() => localStorage.getItem(ASK_KEY) === "1");
   const [pending, setPending] = useState<(ApprovalRequest & { resolve: (ok: boolean) => void }) | null>(null);
+  /** The tool call in flight, if the turn is inside one. Its row only appears
+   *  once it returns, and a command can take minutes to do that. */
+  const [activeTool, setActiveTool] = useState<string | null>(null);
+  /** The last turn's cost. Deliberately not an `Entry`: it's a measurement of
+   *  this machine running this model, not part of the conversation, and
+   *  storing one per turn forever would put it in the transcript search too. */
+  const [stats, setStats] = useState<TurnStats | null>(null);
 
   // `interrupted` is a turn this panel never got to finish — the page was
   // reloaded or the app was killed while the model was working. It outlives the
@@ -293,7 +319,25 @@ export function ChatPanel() {
     stopRef.current = true;
     answer(false); // a gate left open would hold the turn forever
     void cancelChat(cancelRef.current);
+    // And the command, if that's what it's inside. The flag above is only read
+    // between model calls, so a test run with two minutes of timeout left would
+    // otherwise keep going with nothing on screen to say why.
+    void stopCommand();
   }
+
+  // The gate blocks the turn on the user, so it gets the two keys that answer
+  // it — a prompt you can only reach with the mouse is one people turn off.
+  useEffect(() => {
+    if (!pending) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter") answer(true);
+      else if (e.key === "Escape") answer(false);
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pending]);
 
   async function loadModels() {
     setModelsError(null);
@@ -406,6 +450,7 @@ export function ChatPanel() {
   // buffer, which belongs to the project being left, has to go.
   useEffect(() => {
     setStreaming("");
+    setStats(null);
   }, [projectRoot]);
 
   // A reload doesn't stop the model — the request lives in the Rust process,
@@ -439,6 +484,11 @@ export function ChatPanel() {
     setStreaming("");
     setRunning(true);
     setElapsed(0);
+    // The previous turn's numbers describe the previous turn. A resumed one
+    // starts from zero too — the calls it's picking up from were paid for by a
+    // process that no longer exists, and counting them again would say this
+    // turn was slower than it was.
+    setStats(null);
     stopRef.current = false;
     cancelRef.current = `${root}#${Date.now()}`;
     // Marks the turn in flight *before* the first await. Everything from here
@@ -485,14 +535,23 @@ export function ChatPanel() {
             setStreaming("");
             add({ kind: "plan", text: event.text });
             break;
+          case "stats":
+            setStats(event.stats);
+            break;
+          case "running":
+            setActiveTool(event.label);
+            break;
           case "tool":
+            setActiveTool(null);
             add({ kind: "tool", label: event.label, ok: event.ok, detail: event.detail });
             break;
           case "error":
+            setActiveTool(null);
             add({ kind: "error", text: event.text });
             break;
           case "done":
             setStreaming("");
+            setActiveTool(null);
             if (event.reason !== "finished" && event.reason !== "replied") {
               add({ kind: "note", text: event.reason });
             }
@@ -570,6 +629,7 @@ export function ChatPanel() {
           onClick={() => {
             if (projectRoot) clearChat(projectRoot);
             setStreaming("");
+            setStats(null);
           }}
           title="New chat"
           className="shrink-0 rounded bg-neutral-800 px-2 py-1 text-[12px] text-neutral-300 hover:bg-neutral-700"
@@ -651,13 +711,36 @@ export function ChatPanel() {
         })}
 
         {streaming && <RichText text={streaming} />}
-        {running && (
-          <div className="flex items-center gap-1.5 px-2 text-[11px] text-neutral-500">
-            <ThinkingFlame />
-            <span>
-              {streaming ? "writing" : "thinking"}… {elapsed}s
-              {gpuBusy !== null && ` · GPU ${Math.round(gpuBusy)}%`}
-            </span>
+        {/* Survives the turn it measured: "was that slow because the model
+            spilled to CPU, or because the task was long" is a question asked
+            once the waiting is over. */}
+        {(running || stats) && (
+          <div className="flex flex-wrap items-center gap-x-1.5 px-2 text-[11px] text-neutral-500">
+            {running && <ThinkingFlame />}
+            {/* What it's waiting on, most specific first: the user, then the
+                tool in flight, then the model. A counter climbing past two
+                minutes next to "thinking" is how a wait on the gate — or on a
+                test suite — gets read as a hang. */}
+            {running && (
+              <span className="min-w-0 truncate">
+                {pending ? "waiting for you" : (activeTool ?? (streaming ? "writing" : "thinking"))}… {elapsed}s
+                {gpuBusy !== null && ` · GPU ${Math.round(gpuBusy)}%`}
+              </span>
+            )}
+            {stats && (
+              <span title="Model round trips, tokens generated, and the rate across all of them. On this machine a model that fits in VRAM runs at tens of tokens a second and one that spilled to CPU at a few — which is the difference between a turn worth waiting for and one worth abandoning.">
+                {running && "· "}
+                {statLine(stats)}
+              </span>
+            )}
+            {stats?.doneReason && (
+              <span
+                className="text-amber-500"
+                title={`The model stopped for "${stats.doneReason}" rather than because it was finished — "length" means it filled the context window part-way through an answer. A larger context, or a shorter conversation, is what fixes that.`}
+              >
+                · cut off: {stats.doneReason}
+              </span>
+            )}
           </div>
         )}
         <div ref={bottomRef} />
@@ -715,6 +798,7 @@ export function ChatPanel() {
             >
               Refuse
             </button>
+            <span className="shrink-0 text-[10px] text-neutral-600">↵ / esc</span>
           </div>
           <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-950 p-2 text-[11px] text-neutral-400">
             {pending.detail}
@@ -729,6 +813,9 @@ export function ChatPanel() {
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
+              // `send` refuses mid-turn anyway — without this the refusal still
+              // costs the user whatever they had typed while waiting.
+              if (running) return;
               setInput("");
               void send(input.trim());
             }

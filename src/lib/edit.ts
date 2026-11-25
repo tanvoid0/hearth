@@ -98,7 +98,12 @@ export function applyEdits(content: string, edits: Edit[] | Edit): { content: st
 
   for (const [i, edit] of list.entries()) {
     if (next.includes(edit.search)) {
-      next = next.replace(edit.search, edit.replace);
+      // A function replacer, not the string itself: `String.replace` reads `$$`,
+      // `$&`, `` $` `` and `$'` in a string replacement as substitution patterns
+      // even when the needle is a plain string. A model writing `$$` (a Postgres
+      // body, a Makefile variable, a docker-compose escape) would otherwise land
+      // `$` on disk and be told the edit applied.
+      next = next.replace(edit.search, () => edit.replace);
       continue;
     }
     const searchNorm = normalizeWhitespace(edit.search);

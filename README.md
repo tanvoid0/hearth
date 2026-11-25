@@ -70,7 +70,9 @@ The agent checks its own work rather than waiting to be told what broke.
 server's build output, and the running page's browser console — so a
 misspelled `onclick`, which compiles and logs nothing, is caught alongside a
 crash. It can also run the project's own tooling (`npm test`, `npx tsc
---noEmit`) through an allowlist, and find its way around with `search` and
+--noEmit`) through an allowlist — which refuses shell operators and code passed
+on the command line (`node -e`, `python -c`), so it stays a list of tools rather
+than a way to run anything — and find its way around with `search` and
 `repo_map` rather than reading files one at a time. Every turn that changes a
 file becomes a checkpoint you can diff, reject a hunk of, or roll back — from
 the transcript or from the History tab, which outlives the chat.
@@ -85,7 +87,13 @@ reversible. **Stop** aborts the call in flight, not just the next step.
 `.env` files are redacted before the agent ever sees them: it gets the keys and
 the value lengths, never the values. That's less about trusting the model than
 about where a reply ends up — the transcript is stored and replayed as history
-on every later turn.
+on every later turn. The command allowlist is what keeps that from being
+theatre: `node -e` reading the same file back out is refused for the same
+reason.
+
+Paths are checked twice, in TypeScript and again in Rust, so a model asking for
+`../../.ssh/id_rsa` — or for a symlink pointing there — is refused rather than
+served.
 
 ```bash
 pnpm test

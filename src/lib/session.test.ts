@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  addCall,
   contextLimits,
+  isServerScript,
   packHistory,
   sendWindow,
   packTab,
@@ -242,4 +244,51 @@ test("a repair round is only worth repeating if the model actually changed somet
   assert.equal(worthRepairing(1, 3, false), false);
   // And the cap still binds when it has been editing all along.
   assert.equal(worthRepairing(3, 3, true), false);
+});
+
+test("the scripts that never exit are the ones bounced to start_app", () => {
+  for (const command of ["npm run dev", "pnpm dev", "yarn start", "bun run serve", "  npm run dev  "]) {
+    assert.equal(isServerScript(command), true, command);
+  }
+  // Everything else waits, including the scripts whose names merely start the
+  // same way — `npm run build` is exactly what run_command is for.
+  for (const command of ["npm test", "npm run build", "npx tsc --noEmit", "npm run develop", "git status"]) {
+    assert.equal(isServerScript(command), false, command);
+  }
+});
+
+test("a turn's rate is total tokens over total seconds, not the mean of its calls", () => {
+  // One quick call, then a long slow one — the shape of a turn whose later
+  // steps carry a big context. Averaging the two rates would report 55 tok/s;
+  // the turn actually produced 910 tokens in 91 seconds.
+  const quick = { outTokens: 10, genSecs: 0.1, doneReason: "stop" };
+  const slow = { outTokens: 900, genSecs: 90.9, doneReason: "stop" };
+  const after = addCall(addCall(null, quick), slow);
+  assert.equal(after.calls, 2);
+  assert.equal(after.outTokens, 910);
+  assert.equal(Math.round(after.tokensPerSec), 10);
+});
+
+test("only an unclean stop is reported, and only for the call it happened on", () => {
+  assert.equal(addCall(null, { outTokens: 5, genSecs: 1, doneReason: "stop" }).doneReason, undefined);
+
+  // The model filled the window part-way through an answer. Say so.
+  const cut = addCall(null, { outTokens: 5, genSecs: 1, doneReason: "length" });
+  assert.equal(cut.doneReason, "length");
+
+  // The next call ended cleanly, so the warning goes with the call it described
+  // — left standing it would read as though this call had been cut off too.
+  assert.equal(addCall(cut, { outTokens: 5, genSecs: 1, doneReason: "stop" }).doneReason, undefined);
+});
+
+test("a call whose stream carried no counts is still a call", () => {
+  const one = addCall(null, { outTokens: 40, genSecs: 2, doneReason: "length" });
+  const two = addCall(one, null);
+  // Counted, because it happened and it cost time.
+  assert.equal(two.calls, 2);
+  // But it contributes nothing to the totals it said nothing about, and it
+  // doesn't inherit the previous call's cut-off warning.
+  assert.equal(two.outTokens, 40);
+  assert.equal(two.tokensPerSec, 20);
+  assert.equal(two.doneReason, undefined);
 });
