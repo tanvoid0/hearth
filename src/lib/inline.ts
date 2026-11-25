@@ -32,7 +32,7 @@ export async function inlineEdit(opts: {
   const model = currentModel();
   if (!model) throw new Error("no model selected — pick one in the agent panel");
 
-  const reply = await chat(
+  const { message: reply } = await chat(
     model,
     [
       { role: "system", content: SYSTEM },

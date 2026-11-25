@@ -7,6 +7,7 @@ import { attachModel, findReferences, CTRL_K, SHIFT_F12 } from "../lib/monaco-ts
 import { inlineEdit } from "../lib/inline";
 import { cancelChat } from "../lib/ollama";
 import { fileHunks, revertHunk } from "../lib/git";
+import { resolveInProject } from "../lib/edit";
 import type { Hunk } from "../lib/gitdiff";
 
 const EXT_TO_LANGUAGE: Record<string, string> = {
@@ -60,8 +61,11 @@ function HunkStrip({ diff, root }: { diff: DiffView & { sha: string }; root: str
     try {
       await revertHunk(root, diff.path, hunk);
       // The diff above is history and doesn't move; the file on disk and any
-      // open tab do.
-      await useHearthStore.getState().syncFromDisk(diff.path);
+      // open tab do. Resolved first: a `DiffView` path is project-relative (it
+      // comes from git), and `syncFromDisk` matches against tab paths, which are
+      // absolute — handed the relative one it silently matches nothing, leaving
+      // the editor holding pre-revert text that the next save writes back.
+      await useHearthStore.getState().syncFromDisk(resolveInProject(root, diff.path));
       setReverted((s) => new Set(s).add(i));
     } catch (err) {
       setError((err as Error).message);

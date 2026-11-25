@@ -111,6 +111,37 @@ interface ChunkPayload {
   message?: { content?: string; thinking?: string; tool_calls?: ToolCall[] };
   error?: string;
   done?: boolean;
+  done_reason?: string;
+  eval_count?: number;
+  /** Nanoseconds, and only the generation phase — Ollama times model load and
+   *  prompt evaluation separately. */
+  eval_duration?: number;
+}
+
+/**
+ * What one model call cost, read off the final chunk of its stream.
+ *
+ * Elapsed seconds can't tell a model running in VRAM from the same model
+ * spilled to CPU — a long turn and a slow one look identical — and can't tell a
+ * model that decided it was done from one that was cut off mid-sentence. These
+ * are the two numbers that can.
+ */
+export interface CallStats {
+  /** Tokens generated. */
+  outTokens: number;
+  /** Seconds spent generating them, excluding load and prompt evaluation, so a
+   *  rate derived from it is the model's speed rather than the call's. */
+  genSecs: number;
+  /** Why generation stopped. `stop` is the model finishing; `length` is it
+   *  running out of room part-way through an answer. */
+  doneReason: string;
+}
+
+export interface ChatResult {
+  message: ChatMessage;
+  /** Null when the stream ended without a final chunk carrying counts. The
+   *  text still came back — a missing measurement must not cost the reply. */
+  stats: CallStats | null;
 }
 
 /**
@@ -128,10 +159,11 @@ export async function chat(
   /** Names this call so `cancelChat` can abort it. Empty means uncancellable,
    *  which is only right for a caller that has no Stop button. */
   cancelId = ""
-): Promise<ChatMessage> {
+): Promise<ChatResult> {
   let content = "";
   const toolCalls: ToolCall[] = [];
   let streamError: string | undefined;
+  let stats: CallStats | null = null;
 
   const onChunk = new Channel<string>();
   onChunk.onmessage = (line) => {
@@ -151,6 +183,16 @@ export async function chat(
       onToken(piece);
     }
     if (chunk.message?.tool_calls?.length) toolCalls.push(...chunk.message.tool_calls);
+    // Guarded on a count rather than on `done` alone: a final chunk without one
+    // would otherwise be reported as zero tokens at zero tok/s, which reads as
+    // a stalled model rather than as a missing measurement.
+    if (chunk.done && chunk.eval_count) {
+      stats = {
+        outTokens: chunk.eval_count,
+        genSecs: (chunk.eval_duration ?? 0) / 1e9,
+        doneReason: chunk.done_reason ?? "stop",
+      };
+    }
   };
 
   await invoke("ollama_chat", {
@@ -160,7 +202,10 @@ export async function chat(
   });
 
   if (streamError) throw new Error(streamError);
-  return { role: "assistant", content, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) };
+  return {
+    message: { role: "assistant", content, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) },
+    stats,
+  };
 }
 
 /** What a cancelled call rejects with — matched, not displayed, so a deliberate

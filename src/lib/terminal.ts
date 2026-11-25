@@ -21,6 +21,13 @@ export function runCommand(cwd: string, command: string, timeoutSecs: number): P
   return invoke("run_command", { cwd, command, timeoutSecs });
 }
 
+/** Kill whatever `run_command` is running, if anything. The turn loop only
+ *  checks its stop flag between model calls, so without this Stop waits out the
+ *  command's whole timeout before anything visible happens. */
+export function stopCommand(): Promise<void> {
+  return invoke("stop_command");
+}
+
 export async function ptyOpen(
   id: string,
   cwd: string,

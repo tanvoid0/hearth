@@ -1,9 +1,18 @@
-import { listDir, readTextFile, searchFiles, writeTextFile } from "./fs";
+import { listDir, pathExists, readTextFile, searchFiles, writeTextFile } from "./fs";
 import { exportedSymbols, formatRepoMap, isSourceFile } from "./repomap";
 import { isSecretFile, redactEnv } from "./secrets";
 import { applyEdits, changedLines, resolveInProject, samePath, type Edit } from "./edit";
-import { CANCELLED, chat, DEFAULT_NUM_CTX, type ChatMessage, type ToolCall } from "./ollama";
-import { contextLimits, sendWindow, stalled, worthRepairing, wroteThisTurn } from "./session";
+import { CANCELLED, chat, DEFAULT_NUM_CTX, type CallStats, type ChatMessage, type ToolCall } from "./ollama";
+import {
+  addCall,
+  contextLimits,
+  isServerScript,
+  sendWindow,
+  stalled,
+  worthRepairing,
+  wroteThisTurn,
+  type TurnStats,
+} from "./session";
 import { useHearthStore } from "./store";
 import { useRunner } from "./runner";
 import { consoleTail, countErrorsSince, devLogTail } from "./runlog";
@@ -113,9 +122,23 @@ export const TOOL_DEFS = [
   {
     type: "function",
     function: {
+      name: "start_app",
+      description:
+        "Start the project's dev server and wait until it is serving, then return its URL and any build output. Use this rather than running the dev script with run_command: a dev server never exits, so run_command would sit there until it times out and then kill the server. Safe to call when it is already running.",
+      parameters: {
+        type: "object",
+        properties: {
+          script: { type: "string", description: "package.json script to run, defaults to 'dev'" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "run_command",
       description:
-        "Run one program in the project directory and read its output and exit code — tests, builds, type checks. One program per call: no pipes, redirects, or && chaining. Allowed: npm, pnpm, yarn, npx, node, deno, bun, cargo, tsc, vitest, jest, python, and read-only git (status, diff, log, show, branch, ls-files, describe).",
+        "Run one program in the project directory and read its output and exit code — tests, builds, type checks. The program has to exit on its own: use start_app for the dev server. One program per call: no pipes, redirects, or && chaining, and no code on the command line (`node -e`, `python -c`) — put it in a file and run the file. Allowed: npm, pnpm, yarn, npx, node, deno, bun, cargo, tsc, vitest, jest, python, and read-only git (status, diff, log, show, branch, ls-files, describe).",
       parameters: {
         type: "object",
         properties: {
@@ -150,7 +173,18 @@ const MAX_IDENTICAL_CALLS = 3;
 /** A cold `npm install` runs for minutes; anything past this is hung, and a
  *  hung command would otherwise hold the whole turn open. */
 const COMMAND_TIMEOUT_SECS = 180;
+/** How long `start_app` waits for the server to say it's serving. Generous
+ *  because a cold project installs first — the same minutes `install` allows,
+ *  since it is the same install. */
+const START_TIMEOUT_SECS = 300;
 const MAX_LISTED_ENTRIES = 400;
+/** `list_files` is described to the model as depth-limited, and a listing is
+ *  something it asks for one directory at a time. */
+const MAX_LIST_DEPTH = 3;
+/** `repo_map` claims to cover the whole project, so it goes deeper: a monorepo
+ *  keeps its code four or five levels down, and a map that stops at three
+ *  reports the rest as if it didn't exist. */
+const MAX_MAP_DEPTH = 8;
 /** Enough to see the shape of a match set, few enough that a common word
  *  doesn't cost the whole context window. */
 const MAX_SEARCH_HITS = 60;
@@ -161,26 +195,24 @@ export interface ToolResult {
   output: string;
 }
 
-async function walk(dir: string, root: string, depth: number, out: string[]): Promise<void> {
-  if (depth > 3 || out.length >= MAX_LISTED_ENTRIES) return;
+/** Returns whether anything was left out — either cap silently drops files, and
+ *  a model told a listing is complete stops looking for what isn't in it. */
+async function walk(dir: string, root: string, depth: number, out: string[], maxDepth: number): Promise<boolean> {
+  if (out.length >= MAX_LISTED_ENTRIES) return true;
+  if (depth > maxDepth) return true;
+  let cut = false;
   for (const entry of await listDir(dir)) {
-    if (out.length >= MAX_LISTED_ENTRIES) return;
+    if (out.length >= MAX_LISTED_ENTRIES) return true;
     if (SKIP_DIRS.has(entry.name)) continue;
     const rel = entry.path.slice(root.length + 1).replace(/\\/g, "/");
     if (entry.is_dir) {
       out.push(rel + "/");
-      await walk(entry.path, root, depth + 1, out);
+      cut = (await walk(entry.path, root, depth + 1, out, maxDepth)) || cut;
     } else {
       out.push(rel);
     }
   }
-}
-
-async function fileExists(path: string): Promise<boolean> {
-  return readTextFile(path).then(
-    () => true,
-    () => false
-  );
+  return cut;
 }
 
 async function dispatchTool(root: string, name: string, args: any, maxRead: number): Promise<ToolResult> {
@@ -189,8 +221,8 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
       case "list_files": {
         const target = resolveInProject(root, args?.path ?? ".");
         const out: string[] = [];
-        await walk(target, root, 0, out);
-        const truncated = out.length >= MAX_LISTED_ENTRIES ? "\n… (truncated)" : "";
+        const cut = await walk(target, root, 0, out, MAX_LIST_DEPTH);
+        const truncated = cut ? `\n… (not everything is listed — ${MAX_LIST_DEPTH} levels deep at most, list a subdirectory for the rest)` : "";
         return { ok: true, output: out.sort().join("\n") + truncated };
       }
       case "read_file": {
@@ -198,7 +230,7 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
         // Keys, never values (build plan §14). Not about trusting the model:
         // the reply goes into the transcript, which is written to localStorage
         // and sent back as history on every subsequent turn.
-        const raw = await readTextFile(target);
+        const raw = await readTextFile(target, root);
         const content = isSecretFile(target) ? redactEnv(raw) : raw;
         return content.length > maxRead
           ? { ok: true, output: content.slice(0, maxRead) + "\n… (file truncated)" }
@@ -220,12 +252,12 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
           };
         }
 
-        const before = await readTextFile(target);
+        const before = await readTextFile(target, root);
         const { content, failures } = applyEdits(before, edits);
         if (failures.length > 0) {
           return { ok: false, output: `edit_file failed, no changes applied:\n${failures.join("\n\n")}` };
         }
-        await writeTextFile(target, content);
+        await writeTextFile(target, content, root);
         // Tell tsserver before the next get_errors asks it. It holds open files
         // in memory, so a write it doesn't hear about is a file it keeps
         // type-checking at its previous contents.
@@ -238,13 +270,13 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
       }
       case "write_file": {
         const target = resolveInProject(root, args?.path);
-        if (await fileExists(target)) {
+        if (await pathExists(target)) {
           return {
             ok: false,
             output: `error: ${args?.path} already exists — write_file is for new files only, use edit_file to modify it`,
           };
         }
-        await writeTextFile(target, args?.content ?? "");
+        await writeTextFile(target, args?.content ?? "", root);
         useLsp.getState().touch(target, args?.content ?? "");
         useHearthStore.getState().markAgentWrite(target, changedLines("", args?.content ?? ""));
         await useHearthStore.getState().syncFromDisk(target);
@@ -264,15 +296,15 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
       }
       case "repo_map": {
         const entries: string[] = [];
-        await walk(root, root, 0, entries);
+        const cut = await walk(root, root, 0, entries, MAX_MAP_DEPTH);
         const sources = entries.filter((rel) => !rel.endsWith("/") && isSourceFile(rel));
         const files = await Promise.all(
           sources.map(async (rel) => ({
             path: rel,
-            symbols: exportedSymbols(await readTextFile(resolveInProject(root, rel)).catch(() => "")),
+            symbols: exportedSymbols(await readTextFile(resolveInProject(root, rel), root).catch(() => "")),
           })),
         );
-        return { ok: true, output: formatRepoMap(files, entries.length >= MAX_LISTED_ENTRIES) };
+        return { ok: true, output: formatRepoMap(files, cut) };
       }
       case "get_errors": {
         // Type errors first: they cover every file rather than only the one
@@ -289,8 +321,29 @@ async function dispatchTool(root: string, name: string, args: any, maxRead: numb
           ].join("\n\n"),
         };
       }
+      case "start_app": {
+        const runner = useRunner.getState();
+        if (!runner.running) await runner.start(root, args?.script);
+        // `start` returns once the process is spawned; the status machine only
+        // reaches "ready" later, off the server's own output. Polled rather
+        // than subscribed because this is the one place that waits for it.
+        const deadline = Date.now() + START_TIMEOUT_SECS * 1000;
+        while (Date.now() < deadline && ["installing", "starting"].includes(useRunner.getState().status)) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        const { status, url, log } = useRunner.getState();
+        return { ok: status === "ready", output: devLogTail(status, url, log) };
+      }
       case "run_command": {
-        const result = await runCommand(root, String(args?.command ?? ""), COMMAND_TIMEOUT_SECS);
+        const command = String(args?.command ?? "");
+        if (isServerScript(command)) {
+          return {
+            ok: false,
+            output:
+              "refused: that starts a server and never returns. Use start_app instead — it starts the dev server, waits for it, and leaves it running.",
+          };
+        }
+        const result = await runCommand(root, command, COMMAND_TIMEOUT_SECS);
         // Tail, not head: a failing test run ends with the failure and begins
         // with a banner, and the tail is what the model needs.
         const body =
@@ -358,8 +411,16 @@ export type AgentEvent =
   | { type: "token"; text: string }
   | { type: "assistant"; content: string }
   | { type: "plan"; text: string }
+  /** A tool that has started but not returned. The row below only appears once
+   *  it has, and a command can run for minutes — without this the panel says
+   *  "thinking" while the test suite is what's actually taking the time. */
+  | { type: "running"; label: string }
   | { type: "tool"; label: string; ok: boolean; detail: string }
   | { type: "error"; text: string }
+  /** The turn's cost so far, re-emitted as each model call returns rather than
+   *  once at the end. A twelve-step turn on a model that spilled to CPU is
+   *  worth abandoning at step three, and the rate is what says so. */
+  | { type: "stats"; stats: TurnStats }
   | { type: "done"; reason: string };
 
 /** What an approval gate is asked about. `detail` is the change itself — the
@@ -456,7 +517,9 @@ export function systemPrompt(root: string, activeFile?: string | null): string {
     "still crash on load, and a type error is reported whether or not the app is running. Fix",
     "anything it reports and check again before finishing.",
     "Use run_command for anything that needs to actually execute — the test suite, a type check,",
-    "a build. Prefer it over asking the user to run something and paste the result back.",
+    "a build. Prefer it over asking the user to run something and paste the result back. For the",
+    "dev server use start_app, not run_command: it waits for the server to come up and leaves it",
+    "running, which is what makes the browser console half of get_errors report anything.",
     "Calling finish re-checks the project: if errors remain you will be handed them and asked to",
     "keep going, so check and fix before finishing rather than after.",
     activeFile ? `The user currently has ${activeFile} open in the editor.` : "",
@@ -496,21 +559,36 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
   /** Where the sent window starts. Carried across calls rather than recomputed,
    *  which is the whole point — see `sendWindow`. */
   let sentStart = 0;
+  /** What the turn has cost so far. Not carried across turns: it answers "is
+   *  this model worth waiting for on this machine", which is a question about
+   *  the run in front of you. */
+  let stats: TurnStats | null = null;
+
+  /** Fold one call's cost in and report the new total. Every `chat` in this
+   *  function goes through it — a call counted in one place and not another
+   *  would make the tok/s the average of an arbitrary subset. */
+  function counted(result: { message: ChatMessage; stats: CallStats | null }): ChatMessage {
+    stats = addCall(stats, result.stats);
+    onEvent({ type: "stats", stats });
+    return result.message;
+  }
 
   try {
     if (opts.plan && !resuming) {
       messages.push({ role: "user", content: PLAN_PROMPT });
       const plannedWindow = sendWindow(messages, budget, sentStart);
       sentStart = plannedWindow.start;
-      const planned = await chat(
-        model,
-        plannedWindow.messages,
-        [], // no tools: the point is the thinking, not an early edit
-        (text) => {
-          if (!shouldStop()) onEvent({ type: "token", text });
-        },
-        numCtx,
-        cancelId
+      const planned = counted(
+        await chat(
+          model,
+          plannedWindow.messages,
+          [], // no tools: the point is the thinking, not an early edit
+          (text) => {
+            if (!shouldStop()) onEvent({ type: "token", text });
+          },
+          numCtx,
+          cancelId
+        )
       );
       messages.push(planned);
       messages.push({ role: "user", content: PLAN_ACK });
@@ -541,15 +619,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
       // fitting, so the prefix Ollama caches on holds still in between.
       const window = sendWindow(messages, budget, sentStart);
       sentStart = window.start;
-      const reply = await chat(
-        model,
-        window.messages,
-        TOOL_DEFS,
-        (text) => {
-          if (!shouldStop()) onEvent({ type: "token", text });
-        },
-        numCtx,
-        cancelId
+      const reply = counted(
+        await chat(
+          model,
+          window.messages,
+          TOOL_DEFS,
+          (text) => {
+            if (!shouldStop()) onEvent({ type: "token", text });
+          },
+          numCtx,
+          cancelId
+        )
       );
       messages.push(reply);
       if (reply.content.trim()) onEvent({ type: "assistant", content: reply.content });
@@ -638,6 +718,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<ChatMessage[]> {
           }
         }
 
+        onEvent({ type: "running", label: summarize(name, args) });
         const result = await dispatchTool(root, name, args, maxRead);
         // Draw the line the next get_errors reports against: console messages
         // logged before this write describe the code the agent just replaced.

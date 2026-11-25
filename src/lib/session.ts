@@ -1,10 +1,13 @@
 // Session persistence rules, kept import-free (like edit.ts) so `npm test`
-// can exercise them on plain node.
+// can exercise them on plain node. The one import below is `import type`,
+// which is erased before node ever sees it — the rule is about what runs.
 //
 // Only *which* files were open needs storing — disk stays the source of truth
 // for content. The exception is an unsaved draft: that exists nowhere else, so
 // it's kept along with the baseline it was edited from, which is what lets
 // dirtiness survive a reload even for a draft edited down to empty.
+
+import type { CallStats } from "./ollama.ts";
 
 export interface Tab {
   path: string;
@@ -185,6 +188,25 @@ export function wroteThisTurn(messages: Array<{ role: string; tool_name?: string
     .some((m) => m.role === "tool" && (m.tool_name === "edit_file" || m.tool_name === "write_file"));
 }
 
+/**
+ * Does this command start something that never exits?
+ *
+ * `run_command` waits for the program to finish, so a dev server spends the
+ * entire timeout and is then killed with its tree. The model reads the startup
+ * banner in the captured output and reports a server that is already dead —
+ * both the tool row and the summary are telling the truth, and together they
+ * say the opposite of what happened. Bounced to `start_app`, which waits for
+ * the server and leaves it running.
+ *
+ * ponytail: package-manager scripts only. `npx vite` with no subcommand is the
+ * same trap and isn't caught — `npx vite build` is a legitimate thing to wait
+ * for, and separating them means parsing per-tool argv. Add it if a model
+ * actually reaches for it.
+ */
+export function isServerScript(command: string): boolean {
+  return /^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve)\b/.test(command.trim());
+}
+
 // ponytail: chars-per-token estimate, not a tokeniser. 3 is below the usual ~4
 // for code so the guess errs toward underfilling the window, and it has to
 // leave room for the tool definitions and the reply, neither of which is in
@@ -208,4 +230,47 @@ export function contextLimits(numCtx: number): { history: number; read: number }
   // system prompt and the turn that asked for it. At a small `num_ctx` this is
   // what stops one big file from being the entire conversation.
   return { history, read: Math.min(MAX_READ_CHARS, Math.floor(history / 2)) };
+}
+
+/** Every model call in a turn so far, added up. */
+export interface TurnStats {
+  /** Model round trips. A turn is one prompt and up to fifteen of these. */
+  calls: number;
+  outTokens: number;
+  /** Generation seconds across the turn — the denominator, kept so the next
+   *  call can be folded in without re-deriving it from the rate. */
+  genSecs: number;
+  tokensPerSec: number;
+  /** The last call's, and only when it wasn't a clean `stop`. A model cut off
+   *  at the context limit and a model that chose to stop early produce the same
+   *  short answer, and this is the only thing that separates them. */
+  doneReason?: string;
+}
+
+/**
+ * Fold one model call's cost into the turn's running total.
+ *
+ * Pure and separate so the rate has a test. It is deliberately
+ * total-over-total rather than a mean of the per-call rates: averaging those
+ * weights a 12-token call the same as a 900-token one, so a turn whose long
+ * calls crawled on the CPU would report the speed of its short fast ones —
+ * which is the exact case this number exists to expose.
+ */
+export function addCall(prev: TurnStats | null, stats: CallStats | null): TurnStats {
+  const calls = (prev?.calls ?? 0) + 1;
+  // A call whose stream carried no counts tells us nothing about itself,
+  // including whether it ended cleanly — so the previous call's warning is
+  // dropped rather than left standing as if it described this one.
+  if (!stats) {
+    return { calls, outTokens: prev?.outTokens ?? 0, genSecs: prev?.genSecs ?? 0, tokensPerSec: prev?.tokensPerSec ?? 0 };
+  }
+  const outTokens = (prev?.outTokens ?? 0) + stats.outTokens;
+  const genSecs = (prev?.genSecs ?? 0) + stats.genSecs;
+  return {
+    calls,
+    outTokens,
+    genSecs,
+    tokensPerSec: genSecs > 0 ? outTokens / genSecs : 0,
+    ...(stats.doneReason !== "stop" ? { doneReason: stats.doneReason } : {}),
+  };
 }

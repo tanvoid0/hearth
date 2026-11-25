@@ -138,12 +138,12 @@ export async function revertHunk(root: string, path: string, hunk: Hunk): Promis
   if (hunk.after === "") throw new Error("this hunk only removed lines — restore the whole checkpoint instead");
 
   const target = resolveInProject(root, path);
-  const current = await readTextFile(target);
+  const current = await readTextFile(target, root);
   const { content, failures } = applyEdits(current, [{ search: hunk.after, replace: hunk.before }]);
   if (failures.length > 0) {
     throw new Error("this hunk no longer matches the file — it has changed since the checkpoint");
   }
-  await writeTextFile(target, content);
+  await writeTextFile(target, content, root);
 }
 
 /** Put the work tree back to how it looked right after this checkpoint.

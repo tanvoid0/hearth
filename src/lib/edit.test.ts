@@ -38,6 +38,17 @@ test("applyEdits matches exactly, then on normalised whitespace", () => {
   assert.match(indented.content, /return 2;/);
 });
 
+test("applyEdits writes a replacement containing $ verbatim", () => {
+  // `String.replace` reads these as substitution patterns even with a string
+  // needle, so the file used to end up holding something the model never wrote
+  // — and the edit reported success.
+  const sql = applyEdits("CREATE FUNCTION f() AS BODY;\n", [{ search: "BODY", replace: "$$ select 1 $$" }]);
+  assert.equal(sql.content, "CREATE FUNCTION f() AS $$ select 1 $$;\n");
+
+  const make = applyEdits("run:\n\tCMD\n", [{ search: "CMD", replace: "echo $&$`$'" }]);
+  assert.equal(make.content, "run:\n\techo $&$`$'\n");
+});
+
 test("applyEdits is all-or-nothing on a miss", () => {
   const before = "const a = 1;\n";
   const result = applyEdits(before, [

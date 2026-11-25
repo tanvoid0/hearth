@@ -49,17 +49,77 @@ fn list_dir(path: String) -> Result<Vec<DirEntryInfo>, String> {
     Ok(entries)
 }
 
+/// Refuse a path that leaves `root`, following symlinks on the way.
+///
+/// A second implementation of what `resolveInProject` already does in
+/// TypeScript, for the same reason `check_command` lives here rather than in
+/// `terminal.ts`: the paths the agent works on come from a model, and the check
+/// that stops one from reaching the rest of the disk shouldn't be one bug in one
+/// file away from being gone. `root` is optional because the UI legitimately
+/// reads outside the open project — the workspace scan looks for `.hearth`
+/// markers in folders that aren't projects yet — so it's passed by the callers
+/// handling model-supplied paths and omitted by the ones that aren't.
+///
+/// ponytail: a caller that omits `root` is unchecked, so this hardens against a
+/// mistake in the resolver rather than against a frontend that has already been
+/// taken over — at which point `invoke` is the attacker's, root argument and
+/// all. Hold the open project in a static here if that ever stops being true.
+fn inside(root: &str, path: &str) -> Result<(), String> {
+    let base = fs::canonicalize(root).map_err(|e| format!("{}: {}", root, e))?;
+    // A file that doesn't exist yet can't be canonicalized, so walk up to the
+    // nearest ancestor that does and re-attach the rest. `..` is already gone by
+    // then — canonicalize resolves it, which is the point.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = Path::new(path).to_path_buf();
+    let resolved = loop {
+        if let Ok(found) = fs::canonicalize(&probe) {
+            break found;
+        }
+        match (probe.file_name().map(|n| n.to_os_string()), probe.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                probe = parent.to_path_buf();
+            }
+            _ => return Err(format!("{}: no such directory", path)),
+        }
+    };
+    let target = tail.iter().rev().fold(resolved, |p, name| p.join(name));
+
+    if target.starts_with(&base) {
+        Ok(())
+    } else {
+        Err(format!("path escapes project root: {}", path))
+    }
+}
+
 #[tauri::command]
-fn read_text_file(path: String) -> Result<String, String> {
+fn read_text_file(path: String, root: Option<String>) -> Result<String, String> {
+    if let Some(root) = root.as_deref() {
+        inside(root, &path)?;
+    }
     fs::read_to_string(&path).map_err(|e| format!("{}: {}", path, e))
 }
 
 #[tauri::command]
-fn write_text_file(path: String, contents: String) -> Result<(), String> {
+fn write_text_file(path: String, contents: String, root: Option<String>) -> Result<(), String> {
+    if let Some(root) = root.as_deref() {
+        inside(root, &path)?;
+    }
     if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
     }
     fs::write(&path, contents).map_err(|e| format!("{}: {}", path, e))
+}
+
+/// Whether anything is at this path — a file, a directory, either.
+///
+/// `write_file` needs this rather than "did a read succeed": `read_to_string`
+/// fails on a PNG or any other non-UTF-8 file, so a read-based check reports
+/// every binary in the project as absent and the guard against overwriting an
+/// existing file doesn't fire for exactly the files that can't be merged.
+#[tauri::command]
+fn path_exists(path: String) -> bool {
+    Path::new(&path).exists()
 }
 
 fn ollama_host() -> String {
@@ -627,6 +687,30 @@ const ALLOWED_GIT_VERBS: [&str; 7] = ["status", "diff", "log", "show", "branch",
 /// word.
 const SHELL_METACHARACTERS: [char; 8] = ['&', '|', ';', '<', '>', '$', '`', '\n'];
 
+/// Programs on the list above that will also take code on the command line.
+///
+/// Without this the allowlist means "run the project's own tooling"; with
+/// `node -e <code>` it means "run anything", since no metacharacter is needed to
+/// write a one-liner — and the first thing an arbitrary one-liner can do is read
+/// the `.env` that `read_file` deliberately redacts.
+const INTERPRETERS: [&str; 5] = ["node", "deno", "bun", "npx", "python"];
+
+/// Whether a word hands an interpreter code instead of a file: `-e`, `--eval`,
+/// `-p`/`--print` (node evaluates and prints), `-c`/`--command` (python), the
+/// attached form (`python -cprint(1)`), the `--eval=…` form, and deno's `eval`
+/// subcommand. `npx -p` is caught too, which is a package flag rather than an
+/// eval — its long form `--package` still works and the error says so.
+fn hands_over_code(word: &str) -> bool {
+    if word == "eval" {
+        return true;
+    }
+    if matches!(word.split('=').next().unwrap_or(word), "--eval" | "--print" | "--command") {
+        return true;
+    }
+    let mut chars = word.chars();
+    chars.next() == Some('-') && matches!(chars.next(), Some('e') | Some('p') | Some('c'))
+}
+
 fn check_command(command: &str) -> Result<(), String> {
     if let Some(bad) = command.chars().find(|c| SHELL_METACHARACTERS.contains(c)) {
         return Err(format!(
@@ -656,6 +740,15 @@ fn check_command(command: &str) -> Result<(), String> {
         };
     }
 
+    if INTERPRETERS.contains(&program) {
+        if let Some(flag) = words.find(|w| hands_over_code(w)) {
+            return Err(format!(
+                "refused: '{} {}' runs code given on the command line rather than the project's own tooling — put it in a file and run that, or ask the user to run it in the terminal (npx's package flag is spelled --package)",
+                program, flag
+            ));
+        }
+    }
+
     if ALLOWED_PROGRAMS.contains(&program) {
         Ok(())
     } else {
@@ -672,6 +765,26 @@ struct CommandOutput {
     exit_code: i32,
     output: String,
     timed_out: bool,
+}
+
+/// PID of the command the agent is currently running, if any.
+///
+/// Stop has to be able to reach it. The turn loop only checks its stop flag
+/// between model calls, so without this a `npm test` that has three minutes of
+/// timeout left holds the whole turn open after the button is pressed, and the
+/// button looks broken.
+///
+/// ponytail: one slot, like `DEV_PID`. `install` goes through this path too, so
+/// an install and an agent command overlapping leaves only the later one
+/// killable. Key it by caller if something ever runs two on purpose.
+static AGENT_PID: Mutex<Option<u32>> = Mutex::new(None);
+
+#[tauri::command]
+fn stop_command() -> Result<(), String> {
+    match AGENT_PID.lock().unwrap().take() {
+        Some(pid) => kill_tree(pid),
+        None => Ok(()),
+    }
 }
 
 fn drain(pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
@@ -737,6 +850,7 @@ fn run_blocking(cwd: &str, command: &str, timeout_secs: u64) -> Result<CommandOu
 
         let mut child = cmd.spawn().map_err(|e| format!("could not start '{}': {}", command, e))?;
         let pid = child.id();
+        *AGENT_PID.lock().unwrap() = Some(pid);
 
         // Read on threads: waiting on a child while its pipes fill deadlocks.
         let out = child.stdout.take().map(drain);
@@ -744,10 +858,14 @@ fn run_blocking(cwd: &str, command: &str, timeout_secs: u64) -> Result<CommandOu
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let mut timed_out = false;
+        // No `?` inside the loop: an early return would leave a dead pid in
+        // AGENT_PID, and Windows recycles pids — the next Stop would kill
+        // whatever inherited the number.
         let exit_code = loop {
-            match child.try_wait().map_err(|e| e.to_string())? {
-                Some(status) => break status.code().unwrap_or(-1),
-                None if std::time::Instant::now() >= deadline => {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code().unwrap_or(-1),
+                Err(_) => break -1,
+                Ok(None) if std::time::Instant::now() >= deadline => {
                     // Kill the tree: `npm test` is a shim around the runner, and
                     // killing the shim leaves the runner holding the pipes open,
                     // so the drain threads would never finish.
@@ -756,9 +874,13 @@ fn run_blocking(cwd: &str, command: &str, timeout_secs: u64) -> Result<CommandOu
                     timed_out = true;
                     break -1;
                 }
-                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
             }
         };
+        // Cleared before the drains are joined: the process is gone by here, and
+        // a Stop arriving while its output is still being read has nothing left
+        // to kill.
+        *AGENT_PID.lock().unwrap() = None;
 
         let mut output = String::new();
         for handle in [out, err].into_iter().flatten() {
@@ -1092,8 +1214,79 @@ fn take_lines(buf: &mut Vec<u8>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{take_lines, take_message, take_utf8};
+    use super::{check_command, inside, take_lines, take_message, take_utf8};
     use std::io::Write;
+
+    /// The allowlist is only worth anything if it bounds what runs. A shell
+    /// operator was always refused; code on the command line is the same hole
+    /// with no metacharacter in it, and `node -e` can read the `.env` that
+    /// `read_file` redacts.
+    #[test]
+    fn the_allowlist_refuses_code_given_on_the_command_line() {
+        for allowed in [
+            "npm test",
+            "npx tsc --noEmit",
+            "node scripts/build.js",
+            "python manage.py",
+            "cargo build -p hearth", // -p is a package flag, and cargo takes no code
+            "npx --package typescript tsc",
+            "node --experimental-strip-types x.ts", // starts with -e, isn't --eval
+            "git status",
+        ] {
+            assert!(check_command(allowed).is_ok(), "should allow: {allowed}");
+        }
+        for refused in [
+            "node -e console.log(1)",
+            "node --eval=console.log(1)",
+            "node -p require('fs').readFileSync('.env','utf8')",
+            "python -c print(1)",
+            "python -cprint(1)", // the attached form
+            "deno eval console.log(1)",
+            "bun -e console.log(1)",
+            "npm test && rm -rf .",
+            "./evil",
+            "git push",
+        ] {
+            assert!(check_command(refused).is_err(), "should refuse: {refused}");
+        }
+    }
+
+    /// The second copy of `resolveInProject`, which exists so that one bug in
+    /// one TypeScript file isn't the only thing between a model-supplied path
+    /// and the rest of the disk.
+    #[test]
+    fn a_path_outside_the_project_is_refused_symlinks_included() {
+        use std::fs;
+
+        let base = std::env::temp_dir().join(format!("hearth-inside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("project");
+        fs::create_dir_all(root.join("src")).expect("mkdir");
+        fs::create_dir_all(base.join("secrets")).expect("mkdir");
+        fs::write(base.join("secrets/keys.txt"), "shh").unwrap();
+        let root_s = root.to_string_lossy().to_string();
+
+        assert!(inside(&root_s, &root.join("src/a.ts").to_string_lossy()).is_ok());
+        // Doesn't exist yet — write_file's case, resolved through its parent.
+        assert!(inside(&root_s, &root.join("src/new/deep.ts").to_string_lossy()).is_ok());
+        assert!(inside(&root_s, &root.join("../secrets/keys.txt").to_string_lossy()).is_err());
+        assert!(inside(&root_s, &base.join("secrets/keys.txt").to_string_lossy()).is_err());
+
+        // A link inside the project pointing out of it. The string check in
+        // TypeScript can't see this one; canonicalize is why this is here.
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(base.join("secrets"), root.join("link")).is_ok();
+        #[cfg(not(windows))]
+        let linked = std::os::unix::fs::symlink(base.join("secrets"), root.join("link")).is_ok();
+        if linked {
+            assert!(inside(&root_s, &root.join("link/keys.txt").to_string_lossy()).is_err());
+        } else {
+            // Windows needs Developer Mode or an admin shell to make one.
+            eprintln!("no symlink permission; skipping the symlink half");
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn tsserver_framing_survives_arbitrary_chunk_boundaries() {
@@ -1591,6 +1784,7 @@ pub fn run() {
             list_dir,
             read_text_file,
             write_text_file,
+            path_exists,
             ollama_models,
             ollama_ps,
             ollama_unload,
@@ -1608,6 +1802,7 @@ pub fn run() {
             pty_resize,
             pty_close,
             run_command,
+            stop_command,
             git,
             ts_start,
             ts_send,
@@ -1619,6 +1814,7 @@ pub fn run() {
         .on_window_event(|_window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 let _ = stop_dev();
+                let _ = stop_command();
                 close_all_ptys();
                 let _ = ts_stop();
             }
